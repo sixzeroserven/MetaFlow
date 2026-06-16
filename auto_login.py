@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -16,7 +18,12 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from openai_content_client import OpenAIContentClient, build_post_image_prompt, build_product_scene_image_prompt
+from openai_content_client import (
+    OpenAIContentClient,
+    build_post_image_prompt,
+    build_product_scene_image_prompt,
+    extract_image_urls_from_context,
+)
 
 
 DEFAULT_LOGIN_URL = "https://www.facebook.com/login"
@@ -67,6 +74,28 @@ NON_PRODUCT_HOSTS = {
     "x.com",
 }
 
+DEFAULT_COMMENT_ANGLES = (
+    "主打“好看 & 实用”这种短评，像随手夸一句，不要展开。",
+    "说产品看着顺眼又省事，语气轻松，别像广告。",
+    "强调这个产品放家里/门口不会突兀，还挺有用。",
+    "用 cute & practical / pretty & easy / nice & useful 这类短而有力的感觉。",
+    "围绕产品一个小特点，直接说好看、实用、省心、方便中的两个点。",
+    "像朋友聊天：这个产品看着还挺值/挺省事/挺顺眼，但不要说已购买。",
+    "偏生活化：这个产品让一个小角落变好看一点，也不用太费心。",
+    "用个人偏好口吻：I'd put it by the door / 我会放门口这种，但不要说已经用过。",
+    "写家人视角时用推测口吻：my mom would like it / 家里人应该会喜欢，别说已经喜欢。",
+    "评论要短、有力、不完整也可以，别把理由解释太满。",
+    "可以用 &，最后会本地加一个安全表情；句子要像人写的，不要有 slogan 感。",
+)
+
+EXPERIENCE_COMMENT_ANGLES = (
+    "基于真实体验素材，写收到实物后和预期差不多或更好的感觉，别夸过头。",
+    "基于真实体验素材，写产品使用/摆放比较方便，以及当时心情。",
+    "基于真实体验素材，写朋友或家人真实反馈不错，但保持一句话、像随口说。",
+    "基于真实体验素材，写实物的一个基础特点和使用场景，比想象中顺眼。",
+    "基于真实体验素材，写我喜欢把它放在哪里，或者家人也喜欢这个小布置。",
+)
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -92,6 +121,138 @@ def validate_credentials(username: str, password: str) -> None:
     }
     if username in example_values or password in example_values:
         raise ValueError("Please edit .env first and replace LOGIN_USERNAME / LOGIN_PASSWORD with your real values.")
+
+
+def mask_account_value(value: str) -> str:
+    if not value:
+        return "<empty>"
+    if "@" in value:
+        name, domain = value.split("@", 1)
+        return f"{name[:2]}***@{domain}"
+    return f"{value[:3]}***"
+
+
+def normalize_account_config(raw_config) -> dict[str, str]:
+    if not isinstance(raw_config, dict):
+        raise ValueError("Account config must be a JSON object.")
+
+    aliases = {
+        "username": "LOGIN_USERNAME",
+        "login_username": "LOGIN_USERNAME",
+        "email": "LOGIN_USERNAME",
+        "phone": "LOGIN_USERNAME",
+        "password": "LOGIN_PASSWORD",
+        "login_password": "LOGIN_PASSWORD",
+        "profile_dir": "CHROME_PROFILE_DIR",
+        "chrome_profile_dir": "CHROME_PROFILE_DIR",
+        "attach_existing": "CHROME_ATTACH_EXISTING",
+        "chrome_attach_existing": "CHROME_ATTACH_EXISTING",
+        "skip_login": "SKIP_LOGIN",
+        "experience_notes": "AI_COMMENT_EXPERIENCE_NOTES",
+        "comment_experience_notes": "AI_COMMENT_EXPERIENCE_NOTES",
+        "comment_angles": "AI_COMMENT_ANGLES",
+    }
+    allowed = {
+        "LOGIN_USERNAME",
+        "LOGIN_PASSWORD",
+        "CHROME_PROFILE_DIR",
+        "CHROME_ATTACH_EXISTING",
+        "SKIP_LOGIN",
+        "AI_COMMENT_EXPERIENCE_NOTES",
+        "AI_COMMENT_ANGLES",
+    }
+    normalized: dict[str, str] = {}
+    for key, value in raw_config.items():
+        env_key = aliases.get(str(key).lower(), str(key).upper())
+        if env_key not in allowed:
+            continue
+        if isinstance(value, bool):
+            normalized[env_key] = "true" if value else "false"
+        elif isinstance(value, (list, dict)):
+            normalized[env_key] = json.dumps(value, ensure_ascii=False)
+        elif value is not None:
+            normalized[env_key] = str(value)
+    return normalized
+
+
+def apply_account_config(accounts_file: str, account_name: str | None) -> None:
+    if not account_name:
+        return
+
+    path = Path(accounts_file).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Accounts file not found: {path}")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Accounts file must be a JSON object.")
+
+    accounts = data.get("accounts", data)
+    if not isinstance(accounts, dict):
+        raise ValueError("Accounts file must contain an object or an 'accounts' object.")
+    if account_name not in accounts:
+        available = ", ".join(sorted(str(name) for name in accounts.keys()))
+        raise ValueError(f"Account {account_name!r} not found in {path}. Available: {available or '<none>'}")
+
+    config = normalize_account_config(accounts[account_name])
+    for key, value in config.items():
+        os.environ[key] = value
+
+    print(
+        "Using account "
+        f"{account_name!r}: username={mask_account_value(config.get('LOGIN_USERNAME', os.getenv('LOGIN_USERNAME', '')))}, "
+        f"profile_dir={config.get('CHROME_PROFILE_DIR', os.getenv('CHROME_PROFILE_DIR', '<not set>'))}",
+        flush=True,
+    )
+
+
+def parse_comment_items(value: str) -> list[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+
+    separators = ("||", "\n", ";", "；")
+    items = [raw]
+    for separator in separators:
+        if separator in raw:
+            items = raw.split(separator)
+            break
+    return [item.strip() for item in items if item.strip()]
+
+
+def build_comment_style(base_style: str) -> str:
+    experience_notes = (os.getenv("AI_COMMENT_EXPERIENCE_NOTES") or "").strip()
+    custom_angles = parse_comment_items(os.getenv("AI_COMMENT_ANGLES") or "")
+    angles = custom_angles or list(DEFAULT_COMMENT_ANGLES)
+    if experience_notes:
+        angles = angles + list(EXPERIENCE_COMMENT_ANGLES)
+    angle = random.choice(angles)
+
+    if experience_notes:
+        experience_rule = (
+            "真实体验素材："
+            f"{experience_notes[:600]}。可以基于这些素材写收到实物、使用便捷、朋友/家人反馈等亲历内容。"
+        )
+    else:
+        experience_rule = (
+            "真实体验素材：未提供。禁止声称自己已经收到、购买、使用过，"
+            "也不要说朋友或家人已经夸过；可以写 I'd put it... / my family would probably like... / "
+            "looks / would / should / 看起来 / 我会放在... / 家里人应该会喜欢 这类偏好或推测。"
+        )
+
+    return (
+        f"{base_style}\n"
+        f"本次随机评论角度：{angle}\n"
+        f"{experience_rule}\n"
+        "每次都换句式、换开头、换场景细节，避免和之前评论长得很像。"
+    )
 
 
 def wait_visible(driver, selector: str, timeout: int):
@@ -131,6 +292,50 @@ def wait_first_present(driver, locators, timeout: int):
         return False
 
     return WebDriverWait(driver, timeout).until(find_present)
+
+
+def page_has_chrome_network_error(driver) -> bool:
+    try:
+        body_text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+    except Exception:
+        return False
+    markers = (
+        "ERR_NETWORK_CHANGED",
+        "ERR_INTERNET_DISCONNECTED",
+        "ERR_PROXY_CONNECTION_FAILED",
+        "您的连接已中断",
+        "检测到了网络变化",
+        "无法访问此网站",
+    )
+    return any(marker in body_text for marker in markers)
+
+
+def page_looks_logged_out(driver) -> bool:
+    selectors = (
+        'input[name="email"]',
+        'input[name="pass"]',
+        'input[type="password"]',
+    )
+    for selector in selectors:
+        try:
+            for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                if element.is_displayed():
+                    return True
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
+    return False
+
+
+def ensure_logged_in_before_comment(driver, screenshot_path: str = "not_logged_in.png") -> None:
+    if not page_looks_logged_out(driver):
+        return
+    driver.save_screenshot(screenshot_path)
+    raise RuntimeError(
+        "The browser still looks logged out, so Facebook will not show a comment box. "
+        f"Saved screenshot: {screenshot_path}. Log in in this Chrome profile first, then rerun."
+    )
 
 
 def try_click_login_button(driver, selector: str | None, timeout: int) -> bool:
@@ -352,6 +557,7 @@ def collect_post_and_product_context(
 ) -> tuple[str, str, str]:
     post_content = extract_post_content(driver, post_url, timeout)
     product_links = [product_url] if product_url else extract_product_links(driver, post_url)
+    ensure_logged_in_before_comment(driver)
 
     print("\nExtracted post content preview:")
     print("-" * 40)
@@ -528,6 +734,47 @@ def attach_image_to_comment(driver, comment_box, image_path: str, timeout: int) 
     return attach_image_with_file_input(driver, path, timeout)
 
 
+def copy_text_to_clipboard(text: str) -> bool:
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["pbcopy"],
+                input=text.encode("utf-8"),
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Could not copy comment text to clipboard: {exc}", flush=True)
+            return False
+        if result.returncode != 0:
+            stdout = result.stdout.decode("utf-8", errors="replace").strip()
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            output = "\n".join(part for part in [stdout, stderr] if part)
+            print(f"Could not copy comment text to clipboard: {output[:800]}", flush=True)
+            return False
+        return True
+
+    print("Clipboard text paste is currently implemented for macOS only.", flush=True)
+    return False
+
+
+def type_comment_text(driver, comment_box, comment_text: str) -> None:
+    input_mode = os.getenv("COMMENT_TEXT_INPUT_MODE", "paste").strip().lower()
+    if input_mode in {"paste", "clipboard", "auto"} and copy_text_to_clipboard(comment_text):
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
+        comment_box.click()
+        modifier = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
+        ActionChains(driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
+        print("Comment text pasted from clipboard.", flush=True)
+        return
+
+    if input_mode in {"paste", "clipboard"}:
+        raise RuntimeError("Could not paste comment text from clipboard.")
+
+    comment_box.send_keys(comment_text)
+
+
 def comment_on_post(
     driver,
     post_url: str,
@@ -542,6 +789,12 @@ def comment_on_post(
 
     print("Waiting for comment box...", flush=True)
     try:
+        ensure_logged_in_before_comment(driver)
+    except RuntimeError as exc:
+        print(str(exc), flush=True)
+        return
+
+    try:
         comment_box = wait_first_clickable(driver, DEFAULT_COMMENT_BOX_LOCATORS, timeout)
     except TimeoutException:
         screenshot_path = "comment_box_not_found.png"
@@ -551,7 +804,13 @@ def comment_on_post(
 
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
     comment_box.click()
-    comment_box.send_keys(comment_text)
+    try:
+        type_comment_text(driver, comment_box, comment_text)
+    except RuntimeError as exc:
+        screenshot_path = "comment_text_input_failed.png"
+        driver.save_screenshot(screenshot_path)
+        print(f"{exc} Saved screenshot: {screenshot_path}", flush=True)
+        return
     print(f"Comment text typed: {comment_text!r}", flush=True)
 
     image_attached = False
@@ -594,11 +853,30 @@ def submit_login_form(
         print("Waiting for username field...", flush=True)
         email_input = wait_visible(driver, username_selector, timeout)
     except TimeoutException:
-        screenshot_path = "login_field_not_found.png"
-        driver.save_screenshot(screenshot_path)
-        print(f"Username field not found. Saved screenshot: {screenshot_path}", flush=True)
-        print("You may already be logged in, or Facebook may be showing a verification/cookie page.", flush=True)
-        return False
+        if page_has_chrome_network_error(driver):
+            print("Login page hit a Chrome network error. Retrying page load...", flush=True)
+            for attempt in range(1, 4):
+                driver.refresh()
+                time.sleep(min(2 * attempt, 6))
+                try:
+                    email_input = wait_visible(driver, username_selector, timeout)
+                    break
+                except TimeoutException:
+                    if attempt == 3:
+                        screenshot_path = "login_field_not_found.png"
+                        driver.save_screenshot(screenshot_path)
+                        print(f"Username field not found after network retries. Saved screenshot: {screenshot_path}", flush=True)
+                        print("Please reload/login manually in the browser before pressing Enter.", flush=True)
+                        return False
+            else:
+                return False
+        else:
+            screenshot_path = "login_field_not_found.png"
+            driver.save_screenshot(screenshot_path)
+            print(f"Username field not found. Saved screenshot: {screenshot_path}", flush=True)
+            print("You may already be logged in, or Facebook may be showing a verification/cookie page.", flush=True)
+            print("If you are not logged in, log in manually before pressing Enter.", flush=True)
+            return False
 
     email_input.clear()
     email_input.send_keys(username)
@@ -623,6 +901,8 @@ def submit_login_form(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open a login page and submit credentials with Selenium.")
     parser.add_argument("--env", default=".env", help="Path to the env file. Defaults to .env")
+    parser.add_argument("--accounts-file", default=None, help="Path to account JSON. Defaults to ACCOUNTS_FILE or accounts.json")
+    parser.add_argument("--account", default=None, help="Account name to load from the account JSON.")
     parser.add_argument("--post-url", help="Optional Facebook post URL to open after login.")
     parser.add_argument("--comment", help="Optional comment text to type on the post page.")
     parser.add_argument("--comment-image", help="Optional local image path to attach to the comment.")
@@ -639,6 +919,8 @@ def main() -> None:
     args = parser.parse_args()
 
     load_dotenv(args.env)
+    accounts_file = args.accounts_file or os.getenv("ACCOUNTS_FILE", "accounts.json")
+    apply_account_config(accounts_file, args.account or os.getenv("ACCOUNT_NAME"))
 
     login_url = os.getenv("LOGIN_URL", DEFAULT_LOGIN_URL)
     username_selector = os.getenv("USERNAME_SELECTOR", DEFAULT_USERNAME_SELECTOR)
@@ -660,14 +942,18 @@ def main() -> None:
     ai_language = os.getenv("AI_COMMENT_LANGUAGE", "the same language as the post")
     ai_comment_style = os.getenv(
         "AI_COMMENT_STYLE",
-        "简短自然，像看到产品后的真实心情；少描述产品，多表达喜欢、舒服、惊喜、治愈等感受；不官方、不机械、不营销",
+        "更随意一点，像平时聊天；可以自然用 it / this / that，不用刻意说产品名；不要用 The/the 开头；不要直接使用链接或标题里的关键词；偏好“好看 & 实用 / pretty & useful / cute & practical”这种短而有力的评价；表情由程序本地追加；别写成 slogan",
     )
+    ai_comment_style = build_comment_style(ai_comment_style)
     image_prompt = args.image_prompt or os.getenv("IMAGE_PROMPT")
     ai_image_from_post = args.ai_image_from_post or env_bool("AI_IMAGE_FROM_POST", False)
     image_output = args.image_output or os.getenv("IMAGE_OUTPUT", "generated/post_image.png")
     image_size = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
     image_quality = os.getenv("OPENAI_IMAGE_QUALITY", "auto")
-    image_style = os.getenv("AI_IMAGE_STYLE", "product-focused realistic photography, no people, warm natural lighting")
+    image_style = os.getenv(
+        "AI_IMAGE_STYLE",
+        "exact landing-page product match, new background, realistic customer phone photo, no people, no background blur, casual lived-in setting, natural light",
+    )
     submit_comment = args.submit_comment or env_bool("SUBMIT_COMMENT", True)
     confirm_comment = not args.no_confirm_comment and env_bool("CONFIRM_BEFORE_COMMENT", False)
     skip_login = args.skip_login or env_bool("SKIP_LOGIN", False)
@@ -747,6 +1033,7 @@ def main() -> None:
                 )
             else:
                 post_content = extract_post_content(driver, post_url, timeout)
+                ensure_logged_in_before_comment(driver)
                 print("\nExtracted post content preview:")
                 print("-" * 40)
                 print(post_content[:1200] or "<empty>")
@@ -769,9 +1056,9 @@ def main() -> None:
                 result = ai_client.generate_comment(
                     post_content=combined_context,
                     language=ai_language,
-                    style=(
-                        "简短自然，像看到产品后的真实心情；少描述产品，多表达喜欢、舒服、惊喜、治愈等感受；"
-                        "不官方、不机械、不夸张、不营销"
+                    style=build_comment_style(
+                        "随意一点，像真人刷到后随手写；不要用 The/the 开头；"
+                        "可以自然用 it / this / that，不用刻意说产品名；不要直接使用链接或标题里的关键词；偏好“好看 & 实用 / pretty & useful / cute & practical”这种短而有力的评价；表情由程序本地追加；别写成 slogan"
                     ),
                 )
                 if not result or not result.get("comment"):
@@ -787,9 +1074,20 @@ def main() -> None:
                     use_cases=product_use_cases,
                     style=image_style,
                 )
-                output_path = ai_client.generate_image(
+                reference_urls = extract_image_urls_from_context(product_context)
+                if not reference_urls:
+                    prompt_path = Path(image_output).with_suffix(".prompt.txt")
+                    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                    prompt_path.write_text(product_prompt, encoding="utf-8")
+                    raise RuntimeError(
+                        "Could not find product image references on the landing page, so I will not generate a fake product image. "
+                        f"Saved the image prompt for inspection: {prompt_path}"
+                    )
+                print(f"Using product reference images: {', '.join(reference_urls[:2])}", flush=True)
+                output_path = ai_client.generate_image_with_references(
                     prompt=product_prompt,
                     output_path=image_output,
+                    reference_urls=reference_urls,
                     size=image_size,
                     quality=image_quality,
                 )
@@ -800,7 +1098,7 @@ def main() -> None:
                     if getattr(ai_client, "last_error", ""):
                         print(f"Image generation error: {ai_client.last_error}", flush=True)
                     raise RuntimeError(
-                        "OpenAI Images API did not return a usable image. "
+                        "Reference-based image generation failed. I will not fall back to text-only generation because that can create a different product. "
                         f"Saved the image prompt for manual retry: {prompt_path}"
                     )
                 else:

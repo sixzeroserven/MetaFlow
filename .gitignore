@@ -1,8 +1,11 @@
 .env
+accounts.json
+accounts.local.json
 .venv/
 __pycache__/
 *.pyc
 chrome-profile/
+chrome-profile-*/
 generated/
 login_check_failed.png
 *_not_found.png

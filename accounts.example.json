@@ -1,0 +1,20 @@
+{
+  "accounts": {
+    "main": {
+      "username": "your_main_email_or_phone",
+      "password": "your_main_password",
+      "profile_dir": "./chrome-profile-main",
+      "skip_login": false,
+      "attach_existing": false,
+      "experience_notes": ""
+    },
+    "account2": {
+      "username": "your_second_email_or_phone",
+      "password": "your_second_password",
+      "profile_dir": "./chrome-profile-account2",
+      "skip_login": false,
+      "attach_existing": false,
+      "experience_notes": ""
+    }
+  }
+}

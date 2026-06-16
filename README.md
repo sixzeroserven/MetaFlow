@@ -71,6 +71,7 @@ python auto_login.py --skip-login --post-url "https://www.facebook.com/615505841
 POST_URL=https://www.facebook.com/61550584116226/posts/122290195820019470/
 COMMENT_TEXT=good
 COMMENT_IMAGE=
+COMMENT_TEXT_INPUT_MODE=paste
 CONFIRM_BEFORE_COMMENT=false
 SUBMIT_COMMENT=true
 ```
@@ -112,8 +113,22 @@ AI_ATTRIBUTION_BASE_URL=http://47.253.224.99:3000/openai
 AI_ATTRIBUTION_WIRE_API=responses
 AI_ATTRIBUTION_MODEL=gpt-5.5
 AI_COMMENT_LANGUAGE=the same language as the post
-AI_COMMENT_STYLE=简短自然，像看到产品后的真实心情；少描述产品，多表达喜欢、舒服、惊喜、治愈等感受；不官方、不机械、不营销
+AI_COMMENT_STYLE=更随意一点，像平时聊天；可以自然用 it / this / that，不用刻意说产品名；不要用 The/the 开头；不要直接使用链接或标题里的关键词；偏好“好看 & 实用 / pretty & useful / cute & practical”这种短而有力的评价；表情由程序本地追加；别写成 slogan
+AI_COMMENT_EMOJI_ENABLED=true
+AI_COMMENT_EMOJI_MODE=heart
+AI_COMMENT_EXPERIENCE_NOTES=
+AI_COMMENT_ANGLES=好看 & 实用||pretty & useful||cute & practical||nice & easy||looks handy||I'd put it by the door||my mom would like this||家里人应该会喜欢||我会放门口||放阳台应该挺顺眼
 ```
+
+`AI_COMMENT_EMOJI_MODE=heart` 会随机使用红心/爱心类表情，例如 `❤ ♥ ♡`。如果你确认现代 emoji 在 Facebook 粘贴正常，可以改成 `AI_COMMENT_EMOJI_MODE=modern`，会使用 `😊 😍 🥰 😂 🙌 ❤️` 这类更情绪化的表情。
+
+`AI_COMMENT_ANGLES` 可以补充随机评论方向，用 `||` 分隔，例如：
+
+```env
+AI_COMMENT_ANGLES=好看 & 实用||pretty & useful||cute & practical||nice & easy||looks handy||I'd put it by the door||my mom would like this||家里人应该会喜欢
+```
+
+如果要写“收到实物”“用起来方便”“朋友/亲人夸了”这类亲历内容，请只把真实发生过的素材写进 `AI_COMMENT_EXPERIENCE_NOTES`；为空时脚本会避免编造已购买、已收到或亲友已夸的内容。
 
 如果你想让评论也走官方 OpenAI，也可以用：
 
@@ -174,12 +189,18 @@ python auto_login.py --skip-login --post-url "https://www.facebook.com/615505841
 OPENAI_IMAGE_API_KEY=你的官方OpenAI图片Key
 OPENAI_IMAGE_BASE_URL=https://api.openai.com/v1
 OPENAI_IMAGE_MODEL=gpt-image-2
+OPENAI_IMAGE_EDIT_MODEL=gpt-image-2
 OPENAI_IMAGE_API=images
 OPENAI_IMAGE_ENDPOINT_URL=
 OPENAI_IMAGE_ENDPOINT_PATH=/images/generations
+OPENAI_IMAGE_EDIT_ENDPOINT_URL=
+OPENAI_IMAGE_EDIT_ENDPOINT_PATH=/images/edits
+OPENAI_IMAGE_REFERENCE_ENABLED=true
+OPENAI_IMAGE_REFERENCE_FIELD=image[]
+OPENAI_IMAGE_REFERENCE_LIMIT=2
 OPENAI_IMAGE_SIZE=1024x1024
 OPENAI_IMAGE_QUALITY=medium
-AI_IMAGE_STYLE=product-focused realistic photography, no people, warm natural lighting
+AI_IMAGE_STYLE=exact landing-page product match, new background, realistic customer phone photo, no people, no background blur, casual lived-in setting, natural light
 IMAGE_OUTPUT=generated/post_image.png
 ```
 
@@ -224,8 +245,8 @@ python test_gpt_image_2.py
 1. 打开帖子并提取可见文本。
 2. 从帖子链接中挑选第一个外部产品链接；如果识别不到，可用 `--product-url` 手动指定。
 3. 打开产品页，提取标题、描述、正文和图片线索。
-4. 使用 `gpt-image-2` 生成无人物、以产品为主体的展示图。
-5. 生成一条简短、自然、偏心情表达的评论草稿。
+4. 使用 `gpt-image-2` 生成无人物、像用户收到货后随手拍的真实产品图。
+5. 生成一条更随意、有生活气，带产品名称/简称、基础特点、场景和心情的评论草稿。
 6. 把评论和生成的图片填入 Facebook 评论框，等待图片预览渲染后直接提交。
 
 推荐 `.env` 配置：
@@ -235,12 +256,16 @@ OPENAI_IMAGE_API_KEY=你的官方OpenAI图片Key
 OPENAI_IMAGE_BASE_URL=https://api.openai.com/v1
 OPENAI_IMAGE_MODEL=gpt-image-2
 OPENAI_IMAGE_API=images
+OPENAI_IMAGE_REFERENCE_ENABLED=true
+OPENAI_IMAGE_EDIT_ENDPOINT_PATH=/images/edits
 AI_PRODUCT_PROMO=true
 PRODUCT_USE_CASES=home office, daily life, gifting, travel
 AI_COMMENT_LANGUAGE=the same language as the post
-AI_IMAGE_STYLE=product-focused realistic photography, no people, warm natural lighting
+AI_IMAGE_STYLE=exact landing-page product match, new background, realistic customer phone photo, no people, no background blur, casual lived-in setting, natural light
 IMAGE_OUTPUT=generated/product_scene.png
 ```
+
+产品推广图片会优先下载落地页里的产品图作为参考图，再调用图片编辑/参考图接口生成生活场景图；如果参考图下载或参考图生成失败，脚本会停止，不会退回纯文本生图，避免生成出和产品不一致的假图。
 
 运行：
 
@@ -259,6 +284,57 @@ python auto_login.py --skip-login --post-url "https://www.facebook.com/615505841
 ```bash
 python auto_login.py --skip-login --post-url "https://www.facebook.com/61550584116226/posts/122290195820019470/" --ai-product-promo --use-cases "cozy home office, weekend travel, thoughtful gift"
 ```
+
+## 多账号 JSON 配置
+
+如果有多个 Facebook 账号，推荐用 `accounts.json` 统一维护账号和对应的 Chrome 配置目录。先复制示例文件：
+
+```bash
+cp accounts.example.json accounts.json
+```
+
+然后编辑 `accounts.json`：
+
+```json
+{
+  "accounts": {
+    "main": {
+      "username": "主账号邮箱或手机号",
+      "password": "主账号密码",
+      "profile_dir": "./chrome-profile-main",
+      "skip_login": false,
+      "attach_existing": false,
+      "experience_notes": ""
+    },
+    "account2": {
+      "username": "第二个账号邮箱或手机号",
+      "password": "第二个账号密码",
+      "profile_dir": "./chrome-profile-account2",
+      "skip_login": false,
+      "attach_existing": false,
+      "experience_notes": "真实素材示例：收到后颜色比想象顺眼，挂起来挺省事，家里人说门口看着更有节日感"
+    }
+  }
+}
+```
+
+运行时用 `--account` 指定账号：
+
+```bash
+python auto_login.py --account main --post-url "https://www.facebook.com/xxx/posts/xxx/" --ai-comment
+python auto_login.py --account account2 --post-url "https://www.facebook.com/xxx/posts/xxx/" --ai-comment
+```
+
+每个账号会使用自己的 `profile_dir`，避免串号。第一次运行某个账号时，如果 Facebook 要验证码、双重验证或设备确认，手动完成后回终端按 Enter；后续这个目录会保留登录状态。
+
+也可以在 `.env` 固定默认账号：
+
+```env
+ACCOUNTS_FILE=accounts.json
+ACCOUNT_NAME=main
+```
+
+注意：`accounts.json` 已加入 `.gitignore`，不要把真实账号密码提交到 GitHub。
 
 ## 可选：保留登录状态
 

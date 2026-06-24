@@ -1,10 +1,14 @@
 import argparse
+import base64
 import json
 import os
 import random
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
@@ -22,11 +26,13 @@ from openai_content_client import (
     OpenAIContentClient,
     build_post_image_prompt,
     build_product_scene_image_prompt,
+    choose_product_photo_composition,
     extract_image_urls_from_context,
 )
 
 
 DEFAULT_LOGIN_URL = "https://www.facebook.com/login"
+APP_CODE_VERSION = "login-cookie-debug-2026-06-17"
 DEFAULT_USERNAME_SELECTOR = 'input[name="email"]'
 DEFAULT_PASSWORD_SELECTOR = 'input[name="pass"]'
 DEFAULT_COMMENT_BOX_LOCATORS = (
@@ -59,6 +65,9 @@ FACEBOOK_HOSTS = {
     "web.facebook.com",
 }
 NON_PRODUCT_HOSTS = {
+    "app.salesmartly.com",
+    "salesmartly.com",
+    "www.salesmartly.com",
     "instagram.com",
     "www.instagram.com",
     "messenger.com",
@@ -88,6 +97,30 @@ DEFAULT_COMMENT_ANGLES = (
     "可以用 &，最后会本地加一个安全表情；句子要像人写的，不要有 slogan 感。",
 )
 
+COMMENT_OPENING_STYLES = (
+    "开头用 honestly / okay / lowkey / not gonna lie / this kind of thing / I mean 之一，但不要每次一样。",
+    "不要用固定开头；可以直接从产品用途、摆放位置、颜色、低维护、节日氛围中任一点切入。",
+    "用很短的碎片句，像刷到帖子随手回复，不要完整广告句。",
+    "用个人偏好口吻，但只表达 would / looks / seems，不声称已经买过或用过。",
+    "用轻微惊喜口吻，比如 didn't expect / actually / kinda，但不要夸张。",
+)
+
+COMMENT_DETAIL_FOCUS = (
+    "本次只提一个细节：颜色、摆放位置、省心、门口氛围、节日感、清洁维护、角落装饰、整体顺眼，随机取其一，不要面面俱到。",
+    "避免重复 by the door；可换成 porch / entryway / patio / little corner / front step / hallway / outside spot。",
+    "避免重复 cute colors + no fuss 组合；换成 bright but easy / simple and cheerful / looks tidy / low effort / nice little pop。",
+    "不要总说 product；多用 this / it / these / that little setup。",
+    "允许轻微口语省略，比如 would look good there / easy win / nice little touch。",
+)
+
+COMMENT_LENGTH_STYLES = (
+    "长度控制在 8-13 个英文词。",
+    "长度控制在 12-18 个英文词。",
+    "写成一个短句，不要逗号超过 1 个。",
+    "写成两个很短的片段，可以用 & 连接。",
+    "句子节奏要和上次不同：开头、词序、场景词都换掉。",
+)
+
 EXPERIENCE_COMMENT_ANGLES = (
     "基于真实体验素材，写收到实物后和预期差不多或更好的感觉，别夸过头。",
     "基于真实体验素材，写产品使用/摆放比较方便，以及当时心情。",
@@ -102,6 +135,15 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
 
 
 def required_env(name: str) -> str:
@@ -234,6 +276,9 @@ def build_comment_style(base_style: str) -> str:
     if experience_notes:
         angles = angles + list(EXPERIENCE_COMMENT_ANGLES)
     angle = random.choice(angles)
+    opening_style = random.choice(COMMENT_OPENING_STYLES)
+    detail_focus = random.choice(COMMENT_DETAIL_FOCUS)
+    length_style = random.choice(COMMENT_LENGTH_STYLES)
 
     if experience_notes:
         experience_rule = (
@@ -250,8 +295,13 @@ def build_comment_style(base_style: str) -> str:
     return (
         f"{base_style}\n"
         f"本次随机评论角度：{angle}\n"
+        f"本次随机开头/语气：{opening_style}\n"
+        f"本次随机细节焦点：{detail_focus}\n"
+        f"本次随机长度/节奏：{length_style}\n"
         f"{experience_rule}\n"
-        "每次都换句式、换开头、换场景细节，避免和之前评论长得很像。"
+        "强随机要求：每次都换句式、换开头、换场景词、换形容词组合；"
+        "不要连续使用 by the door / cute colors / no fuss 这类固定组合；"
+        "如果上一条可能像 I'd put this by the door，就换成 porch、front step、entryway、patio、little corner 等不同说法。"
     )
 
 
@@ -275,6 +325,61 @@ def wait_first_clickable(driver, locators, timeout: int):
         return False
 
     return WebDriverWait(driver, timeout).until(find_clickable)
+
+
+def find_visible_comment_box(driver):
+    script = """
+const terms = ['comment', 'komentar', 'tulis komentar', 'write a comment', '评论'];
+const blocked = ['search', 'cari', 'message', 'pesan'];
+const viewportW = window.innerWidth || document.documentElement.clientWidth;
+const viewportH = window.innerHeight || document.documentElement.clientHeight;
+const candidates = Array.from(document.querySelectorAll('div[role="textbox"][contenteditable="true"]'))
+  .map((el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    const label = [
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('aria-placeholder') || '',
+      el.getAttribute('placeholder') || '',
+      el.innerText || ''
+    ].join(' ').toLowerCase();
+    const visible = style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0;
+    const inViewport = rect.bottom > 0 && rect.right > 0 && rect.top < viewportH && rect.left < viewportW;
+    return {el, rect, label, visible, inViewport};
+  })
+  .filter((item) => {
+    if (!item.visible || !item.inViewport) return false;
+    const dialog = item.el.closest('[role="dialog"]');
+    const dialogText = dialog ? (dialog.innerText || '').toLowerCase() : '';
+    if (
+      dialogText.includes('buat postingan') ||
+      dialogText.includes('create post') ||
+      dialogText.includes('apa yang anda pikirkan') ||
+      dialogText.includes("what's on your mind")
+    ) return false;
+    if (item.rect.width < 140 || item.rect.height < 18) return false;
+    if (blocked.some((term) => item.label.includes(term))) return false;
+    return terms.some((term) => item.label.includes(term)) || item.rect.top > viewportH * 0.45;
+  })
+  .map((item) => {
+    let score = 0;
+    if (terms.some((term) => item.label.includes(term))) score += 1000;
+    if (item.rect.top > viewportH * 0.45) score += 200;
+    score += Math.min(item.rect.width, 800) / 10;
+    score -= Math.abs(item.rect.bottom - viewportH) / 20;
+    return {...item, score};
+  })
+  .sort((a, b) => b.score - a.score);
+return candidates.length ? candidates[0].el : null;
+"""
+    try:
+        return driver.execute_script(script)
+    except Exception:
+        return None
+
+
+def wait_visible_comment_box(driver, timeout: int):
+    return WebDriverWait(driver, timeout).until(lambda current_driver: find_visible_comment_box(current_driver))
 
 
 def wait_first_present(driver, locators, timeout: int):
@@ -310,7 +415,38 @@ def page_has_chrome_network_error(driver) -> bool:
     return any(marker in body_text for marker in markers)
 
 
-def page_looks_logged_out(driver) -> bool:
+def facebook_cookie_names(driver) -> set[str]:
+    """Return Facebook cookie names visible to the whole Chrome session."""
+    names: set[str] = set()
+    try:
+        data = driver.execute_cdp_cmd("Network.getAllCookies", {})
+        for cookie in data.get("cookies", []):
+            domain = str(cookie.get("domain") or "")
+            name = str(cookie.get("name") or "")
+            if "facebook.com" in domain and name:
+                names.add(name)
+    except Exception:
+        pass
+
+    try:
+        for cookie in driver.get_cookies():
+            domain = str(cookie.get("domain") or "")
+            name = str(cookie.get("name") or "")
+            if (not domain or "facebook.com" in domain) and name:
+                names.add(name)
+    except Exception:
+        pass
+
+    return names
+
+
+def facebook_session_cookies_present(driver) -> bool:
+    """Return True when the active Chrome profile has a Facebook login session."""
+    names = facebook_cookie_names(driver)
+    return bool({"c_user", "xs"}.issubset(names))
+
+
+def visible_facebook_login_fields(driver) -> bool:
     selectors = (
         'input[name="email"]',
         'input[name="pass"]',
@@ -328,12 +464,75 @@ def page_looks_logged_out(driver) -> bool:
     return False
 
 
-def ensure_logged_in_before_comment(driver, screenshot_path: str = "not_logged_in.png") -> None:
-    if not page_looks_logged_out(driver):
+def page_looks_logged_out(driver) -> bool:
+    if facebook_session_cookies_present(driver):
+        return False
+    return visible_facebook_login_fields(driver)
+
+
+def facebook_session_debug(driver) -> str:
+    names = facebook_cookie_names(driver)
+    important = [name for name in ("c_user", "xs", "fr", "datr", "sb") if name in names]
+    try:
+        current_url = driver.current_url
+    except Exception:
+        current_url = "<unknown>"
+    login_fields = visible_facebook_login_fields(driver)
+    return f"url={current_url}; facebook_cookies={important or '<none>'}; login_fields_visible={login_fields}"
+
+
+def wait_until_facebook_session_saved(driver, wait_timeout: int, post_url: str = "") -> bool:
+    deadline = time.time() + max(10, wait_timeout)
+    last_log = 0.0
+    while time.time() < deadline:
+        if facebook_session_cookies_present(driver):
+            print("Facebook login cookies detected. Verifying session on facebook.com...", flush=True)
+            try:
+                driver.get("https://www.facebook.com/")
+                time.sleep(4)
+            except Exception:
+                pass
+            print(f"Facebook session check: {facebook_session_debug(driver)}", flush=True)
+            if facebook_session_cookies_present(driver) and not visible_facebook_login_fields(driver):
+                print("Facebook login session detected and verified.", flush=True)
+                time.sleep(3)
+                if post_url:
+                    driver.get(post_url)
+                return True
+
+        now = time.time()
+        if now - last_log >= 10:
+            print(f"Still waiting for Facebook login session... {facebook_session_debug(driver)}", flush=True)
+            last_log = now
+        time.sleep(2)
+    return False
+
+
+def ensure_logged_in_before_comment(
+    driver,
+    screenshot_path: str = "not_logged_in.png",
+    wait_if_needed: bool = False,
+    post_url: str = "",
+    wait_timeout: int = 300,
+) -> None:
+    if facebook_session_cookies_present(driver):
+        print(f"Facebook session already present: {facebook_session_debug(driver)}", flush=True)
         return
+
+    if wait_if_needed:
+        driver.save_screenshot(screenshot_path)
+        print(
+            "No saved Facebook login session was detected in this Chrome profile. "
+            "Please log in manually in the opened Chrome window. "
+            f"Waiting up to {wait_timeout} seconds before continuing...",
+            flush=True,
+        )
+        if wait_until_facebook_session_saved(driver, wait_timeout=wait_timeout, post_url=post_url):
+            return
+
     driver.save_screenshot(screenshot_path)
     raise RuntimeError(
-        "The browser still looks logged out, so Facebook will not show a comment box. "
+        "The browser still has no saved Facebook login session, so Facebook will not show a comment box. "
         f"Saved screenshot: {screenshot_path}. Log in in this Chrome profile first, then rerun."
     )
 
@@ -352,11 +551,160 @@ def try_click_login_button(driver, selector: str | None, timeout: int) -> bool:
         return False
 
 
+def cleanup_stale_chrome_profile_locks(profile_path: Path) -> None:
+    lock_paths = [
+        profile_path / "SingletonLock",
+        profile_path / "SingletonSocket",
+        profile_path / "SingletonCookie",
+    ]
+    existing_locks = [path for path in lock_paths if path.exists() or path.is_symlink()]
+    if not existing_locks:
+        return
+
+    socket_path = profile_path / "SingletonSocket"
+    socket_target_missing = socket_path.is_symlink() and not socket_path.exists()
+    if not socket_target_missing:
+        return
+
+    for path in existing_locks:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    print(f"Removed stale Chrome profile lock files from {profile_path}.", flush=True)
+
+
+def chrome_proxy_settings() -> dict:
+    raw_server = os.getenv("CHROME_PROXY_SERVER", "").strip()
+    host = os.getenv("CHROME_PROXY_HOST", "").strip()
+    port = os.getenv("CHROME_PROXY_PORT", "").strip()
+    scheme = os.getenv("CHROME_PROXY_SCHEME", "http").strip().lower() or "http"
+    username = os.getenv("CHROME_PROXY_USERNAME", "").strip()
+    password = os.getenv("CHROME_PROXY_PASSWORD", "")
+    bypass = os.getenv("CHROME_PROXY_BYPASS", "localhost,127.0.0.1,::1").strip()
+
+    if raw_server:
+        parsed = urlparse(raw_server if "://" in raw_server else f"{scheme}://{raw_server}")
+        scheme = parsed.scheme or scheme
+        host = host or (parsed.hostname or "")
+        port = port or (str(parsed.port) if parsed.port else "")
+        if not username and parsed.username:
+            username = unquote(parsed.username)
+        if not password and parsed.password:
+            password = unquote(parsed.password)
+
+    return {
+        "scheme": scheme,
+        "host": host,
+        "port": int(port) if str(port).isdigit() else 0,
+        "username": username,
+        "password": password,
+        "bypass": bypass,
+    }
+
+
+def write_chrome_proxy_auth_extension(proxy: dict, extension_dir: Path) -> Path:
+    bypass_list = [item.strip() for item in str(proxy.get("bypass") or "").split(",") if item.strip()]
+    background_js = f"""
+const config = {{
+  mode: "fixed_servers",
+  rules: {{
+    singleProxy: {{
+      scheme: {json.dumps(proxy["scheme"])},
+      host: {json.dumps(proxy["host"])},
+      port: {int(proxy["port"])},
+    }},
+    bypassList: {json.dumps(bypass_list)},
+  }},
+}};
+
+chrome.proxy.settings.set({{value: config, scope: "regular"}});
+
+chrome.webRequest.onAuthRequired.addListener(
+  function(details) {{
+    return {{
+      authCredentials: {{
+        username: {json.dumps(proxy["username"])},
+        password: {json.dumps(proxy["password"])},
+      }},
+    }};
+  }},
+  {{urls: ["<all_urls>"]}},
+  ["blocking"]
+);
+"""
+    manifest = {
+        "manifest_version": 2,
+        "name": "MetaFlow Proxy Auth",
+        "version": "1.0.0",
+        "permissions": [
+            "proxy",
+            "webRequest",
+            "webRequestBlocking",
+            "<all_urls>",
+        ],
+        "background": {"scripts": ["background.js"]},
+    }
+    extension_dir.mkdir(parents=True, exist_ok=True)
+    (extension_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    (extension_dir / "background.js").write_text(background_js, encoding="utf-8")
+    return extension_dir
+
+
+def create_chrome_proxy_auth_extension(proxy: dict) -> Path:
+    extension_dir = Path(tempfile.mkdtemp(prefix="metaflow_proxy_auth_"))
+    return write_chrome_proxy_auth_extension(proxy, extension_dir)
+
+
+def chrome_proxy_command_args() -> list[str]:
+    proxy = chrome_proxy_settings()
+    if not proxy["host"] or not proxy["port"]:
+        return []
+
+    proxy_server = f'{proxy["scheme"]}://{proxy["host"]}:{proxy["port"]}'
+    args = [f"--proxy-server={proxy_server}"]
+    if proxy["bypass"]:
+        args.append(f"--proxy-bypass-list={proxy['bypass']}")
+
+    if proxy["username"] or proxy["password"]:
+        extension_path = create_chrome_proxy_auth_extension(proxy)
+        args.append(f"--load-extension={extension_path}")
+    return args
+
+
+def configure_chrome_proxy(options: Options) -> None:
+    proxy = chrome_proxy_settings()
+    if not proxy["host"] or not proxy["port"]:
+        return
+
+    proxy_server = f'{proxy["scheme"]}://{proxy["host"]}:{proxy["port"]}'
+    options.add_argument(f"--proxy-server={proxy_server}")
+    if proxy["bypass"]:
+        options.add_argument(f"--proxy-bypass-list={proxy['bypass']}")
+
+    if proxy["username"] or proxy["password"]:
+        extension_path = create_chrome_proxy_auth_extension(proxy)
+        options.add_argument(f"--load-extension={extension_path}")
+        print(f"Chrome proxy enabled with auth: {proxy['scheme']}://{proxy['host']}:{proxy['port']}", flush=True)
+    else:
+        print(f"Chrome proxy enabled: {proxy_server}", flush=True)
+
+
 def build_driver(profile_dir: str | None, headless: bool) -> webdriver.Chrome:
     options = Options()
+    chrome_binary = os.getenv("CHROME_BINARY", "").strip()
+    if chrome_binary:
+        options.binary_location = chrome_binary
+
     options.add_argument("--start-maximized")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    for arg in parse_comment_items(os.getenv("CHROME_EXTRA_ARGS", "")):
+        options.add_argument(arg)
+    configure_chrome_proxy(options)
 
     debugger_address = os.getenv("CHROME_DEBUGGER_ADDRESS", "").strip()
     if not debugger_address and profile_dir and env_bool("CHROME_ATTACH_EXISTING", False):
@@ -379,6 +727,8 @@ def build_driver(profile_dir: str | None, headless: bool) -> webdriver.Chrome:
     if profile_dir:
         profile_path = Path(profile_dir).expanduser().resolve()
         profile_path.mkdir(parents=True, exist_ok=True)
+        cleanup_stale_chrome_profile_locks(profile_path)
+        print(f"Using Chrome profile directory: {profile_path}", flush=True)
         options.add_argument(f"--user-data-dir={profile_path}")
 
     if headless:
@@ -393,6 +743,27 @@ def build_driver(profile_dir: str | None, headless: bool) -> webdriver.Chrome:
             "to a new folder such as ./chrome-profile-2."
         )
         raise RuntimeError(hint) from exc
+
+
+def wait_for_manual_login(driver, login_url: str, wait_timeout: int = 300) -> None:
+    print(f"Opening login page for manual login: {login_url}", flush=True)
+    driver.get(login_url)
+    time.sleep(2)
+    if facebook_session_cookies_present(driver):
+        print(f"This Chrome profile already has a saved Facebook login session: {facebook_session_debug(driver)}", flush=True)
+        return
+
+    print(
+        "Please finish Facebook login/verification in the opened Chrome window. "
+        f"Waiting up to {wait_timeout} seconds...",
+        flush=True,
+    )
+    if wait_until_facebook_session_saved(driver, wait_timeout=wait_timeout):
+        return
+
+    screenshot_path = "manual_login_timeout.png"
+    driver.save_screenshot(screenshot_path)
+    raise RuntimeError(f"Manual login was not detected before timeout. Saved screenshot: {screenshot_path}")
 
 
 def clean_post_text(text: str, max_chars: int = 5000) -> str:
@@ -554,10 +925,17 @@ def collect_post_and_product_context(
     post_url: str,
     timeout: int,
     product_url: str | None = None,
+    wait_login_if_needed: bool = False,
+    login_wait_timeout: int = 300,
 ) -> tuple[str, str, str]:
     post_content = extract_post_content(driver, post_url, timeout)
     product_links = [product_url] if product_url else extract_product_links(driver, post_url)
-    ensure_logged_in_before_comment(driver)
+    ensure_logged_in_before_comment(
+        driver,
+        wait_if_needed=wait_login_if_needed,
+        post_url=post_url,
+        wait_timeout=login_wait_timeout,
+    )
 
     print("\nExtracted post content preview:")
     print("-" * 40)
@@ -600,10 +978,293 @@ def find_file_input(driver):
     return image_inputs[0] if image_inputs else inputs[0]
 
 
-def click_comment_photo_button(driver) -> bool:
+def known_file_input_ids(driver) -> set[str]:
+    script = """
+window.__metaflowFileInputSeq = window.__metaflowFileInputSeq || 1;
+return Array.from(document.querySelectorAll('input[type="file"]')).map((el) => {
+  if (!el.dataset.metaflowFileInputId) {
+    el.dataset.metaflowFileInputId = String(window.__metaflowFileInputSeq++);
+  }
+  return el.dataset.metaflowFileInputId;
+});
+"""
+    try:
+        return {str(value) for value in (driver.execute_script(script) or [])}
+    except Exception:
+        return set()
+
+
+def find_file_input_by_ids(driver, known_ids: set[str] | None = None):
+    script = """
+const known = new Set(arguments[0] || []);
+window.__metaflowFileInputSeq = window.__metaflowFileInputSeq || 1;
+const inputs = Array.from(document.querySelectorAll('input[type="file"]')).map((el) => {
+  if (!el.dataset.metaflowFileInputId) {
+    el.dataset.metaflowFileInputId = String(window.__metaflowFileInputSeq++);
+  }
+  const accept = (el.getAttribute('accept') || '').toLowerCase();
+  const rect = el.getBoundingClientRect();
+  return {
+    el,
+    id: el.dataset.metaflowFileInputId,
+    image: !accept || accept.includes('image'),
+    fresh: !known.has(el.dataset.metaflowFileInputId),
+    visible: rect.width > 0 && rect.height > 0
+  };
+});
+const imageInputs = inputs.filter((item) => item.image);
+const fresh = imageInputs.filter((item) => item.fresh);
+if (fresh.length) return fresh[fresh.length - 1].el;
+const visible = imageInputs.filter((item) => item.visible);
+if (visible.length) return visible[visible.length - 1].el;
+if (imageInputs.length) return imageInputs[imageInputs.length - 1].el;
+return null;
+"""
+    try:
+        return driver.execute_script(script, list(known_ids or set()))
+    except Exception:
+        return None
+
+
+def find_file_inputs_by_ids(driver, known_ids: set[str] | None = None, comment_box=None) -> list:
+    script = """
+const known = new Set(arguments[0] || []);
+const box = arguments[1] || null;
+const boxRect = box ? box.getBoundingClientRect() : null;
+const commentForm = box ? box.closest('form') : null;
+window.__metaflowFileInputSeq = window.__metaflowFileInputSeq || 1;
+const items = Array.from(document.querySelectorAll('input[type="file"]')).map((el, index) => {
+  if (!el.dataset.metaflowFileInputId) {
+    el.dataset.metaflowFileInputId = String(window.__metaflowFileInputSeq++);
+  }
+  const accept = (el.getAttribute('accept') || '').toLowerCase();
+  const rect = el.getBoundingClientRect();
+  const inCommentForm = Boolean(commentForm && commentForm.contains(el));
+  let ancestor = el.parentElement;
+  let ancestorText = '';
+  let nearComment = false;
+  for (let i = 0; i < 8 && ancestor; i++, ancestor = ancestor.parentElement) {
+    ancestorText += ' ' + (ancestor.innerText || '').slice(0, 300).toLowerCase();
+    if (boxRect) {
+      const ar = ancestor.getBoundingClientRect();
+      if (
+        ar.width > 0 && ar.height > 0 &&
+        ar.bottom >= boxRect.top - 80 &&
+        ar.top <= boxRect.bottom + 160 &&
+        ar.right >= boxRect.left - 120 &&
+        ar.left <= boxRect.right + 180
+      ) nearComment = true;
+    }
+  }
+  const createPost = ancestorText.includes('buat postingan') || ancestorText.includes('create post') ||
+    ancestorText.includes('apa yang anda pikirkan') || ancestorText.includes("what's on your mind");
+  return {
+    el,
+    index,
+    id: el.dataset.metaflowFileInputId,
+    image: !accept || accept.includes('image'),
+    fresh: !known.has(el.dataset.metaflowFileInputId),
+    visible: rect.width > 0 && rect.height > 0,
+    accept,
+    inCommentForm,
+    nearComment,
+    createPost
+  };
+}).filter((item) => item.image);
+const scoped = items.filter((item) => (item.inCommentForm || item.nearComment) && !item.createPost);
+const sortable = scoped.length ? scoped : items.filter((item) => !item.createPost);
+if (!sortable.length) return [];
+sortable.sort((a, b) => {
+  if (a.inCommentForm !== b.inCommentForm) return a.inCommentForm ? -1 : 1;
+  if (a.nearComment !== b.nearComment) return a.nearComment ? -1 : 1;
+  if (a.fresh !== b.fresh) return a.fresh ? -1 : 1;
+  if (a.visible !== b.visible) return a.visible ? -1 : 1;
+  const aImageFirst = a.accept.trim().startsWith('image') ? 0 : 1;
+  const bImageFirst = b.accept.trim().startsWith('image') ? 0 : 1;
+  if (aImageFirst !== bImageFirst) return aImageFirst - bImageFirst;
+  return b.index - a.index;
+});
+return sortable.map((item) => item.el);
+"""
+    try:
+        return list(driver.execute_script(script, list(known_ids or set()), comment_box) or [])
+    except Exception:
+        return []
+
+
+def find_comment_photo_buttons(driver, comment_box) -> list:
+    script = """
+const box = arguments[0];
+const boxRect = box.getBoundingClientRect();
+const allowed = ['photo', 'foto', 'gambar', 'image', 'camera', 'kamera', 'attach', 'lampir', '照片', '图片', '相机'];
+const blocked = ['gif', 'emoji', 'sticker', 'stiker', 'avatar', 'profile', 'send', 'kirim'];
+const viewportW = window.innerWidth || document.documentElement.clientWidth;
+const viewportH = window.innerHeight || document.documentElement.clientHeight;
+const items = Array.from(document.querySelectorAll('[role="button"], button, [aria-label]'))
+  .map((el) => {
+    const rect = el.getBoundingClientRect();
+    const label = [
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.innerText || '',
+      Array.from(el.querySelectorAll('[aria-label]')).map((child) => child.getAttribute('aria-label') || '').join(' ')
+    ].join(' ').toLowerCase().trim();
+    const style = window.getComputedStyle(el);
+    const disabled = el.getAttribute('aria-disabled') === 'true' || el.disabled;
+    const hasMediaGlyph = Boolean(el.querySelector('svg, img, i, [style*="mask"], [style*="background"]'));
+    return {el, rect, label, style, disabled, hasMediaGlyph};
+  })
+  .filter((item) => {
+    if (item.disabled || item.style.visibility === 'hidden' || item.style.display === 'none') return false;
+    if (Number(item.style.opacity || '1') <= 0) return false;
+    if (item.rect.bottom <= 0 || item.rect.right <= 0 || item.rect.top >= viewportH || item.rect.left >= viewportW) return false;
+    if (item.rect.width < 10 || item.rect.height < 10 || item.rect.width > 120 || item.rect.height > 120) return false;
+    if (blocked.some((term) => item.label.includes(term))) return false;
+    const hasAllowedLabel = allowed.some((term) => item.label.includes(term));
+    const nearY = item.rect.top >= boxRect.top - 35 && item.rect.bottom <= boxRect.bottom + 140;
+    const nearX = item.rect.left >= boxRect.left - 80 && item.rect.left <= boxRect.right + 120;
+    if (!nearY || !nearX) return false;
+    if (hasAllowedLabel) return true;
+    // Some Facebook locales render the comment photo icon without an aria-label.
+    const toolbarFallback = item.hasMediaGlyph &&
+      item.rect.top >= boxRect.top - 5 &&
+      item.rect.left <= boxRect.left + 240 &&
+      item.rect.width <= 56 &&
+      item.rect.height <= 56;
+    return toolbarFallback;
+  })
+  .sort((a, b) => {
+    const aAllowed = allowed.some((term) => a.label.includes(term)) ? 0 : 1;
+    const bAllowed = allowed.some((term) => b.label.includes(term)) ? 0 : 1;
+    if (aAllowed !== bAllowed) return aAllowed - bAllowed;
+    const aDistance = Math.abs(a.rect.top - boxRect.bottom) + Math.abs(a.rect.left - boxRect.left);
+    const bDistance = Math.abs(b.rect.top - boxRect.bottom) + Math.abs(b.rect.left - boxRect.left);
+    return aDistance - bDistance;
+  });
+return items.map((item) => item.el);
+"""
+    try:
+        return list(driver.execute_script(script, comment_box) or [])
+    except Exception:
+        return []
+
+
+def find_comment_photo_button(driver, comment_box):
+    buttons = find_comment_photo_buttons(driver, comment_box)
+    return buttons[0] if buttons else None
+
+
+def close_unrelated_post_dialog(driver) -> bool:
+    script = """
+const clickVisibleButton = (dialog, matcher) => {
+  const dialogRect = dialog.getBoundingClientRect();
+  const buttons = Array.from(dialog.querySelectorAll('[role="button"], button'))
+    .map((el) => ({el, rect: el.getBoundingClientRect(), label: [
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.innerText || ''
+    ].join(' ').toLowerCase().trim()}))
+    .filter((item) => item.rect.width > 10 && item.rect.height > 10);
+  const match = buttons.find((item) => matcher(item, dialogRect));
+  if (match) {
+    match.el.click();
+    return true;
+  }
+  return false;
+};
+
+const draftDialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((dialog) => {
+  const rect = dialog.getBoundingClientRect();
+  const style = window.getComputedStyle(dialog);
+  if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') return false;
+  const text = (dialog.innerText || '').toLowerCase();
+  return (
+    text.includes('simpan postingan ini sebagai draf') ||
+    text.includes('save this post as a draft') ||
+    text.includes('hapus draf') ||
+    text.includes('discard draft')
+  );
+});
+for (const dialog of draftDialogs) {
+  if (clickVisibleButton(dialog, (item) =>
+    item.label.includes('hapus draf') ||
+    item.label.includes('discard draft') ||
+    item.label.includes('delete draft')
+  )) return 'discarded';
+}
+
+const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((dialog) => {
+  const rect = dialog.getBoundingClientRect();
+  const style = window.getComputedStyle(dialog);
+  if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') return false;
+  const text = (dialog.innerText || '').toLowerCase();
+  return (
+    (text.includes('buat postingan') || text.includes('create post')) &&
+    (text.includes('apa yang anda pikirkan') || text.includes("what's on your mind") || text.includes('tambahkan ke postingan'))
+  );
+});
+for (const dialog of dialogs) {
+  if (clickVisibleButton(dialog, (item, dialogRect) =>
+    item.label.includes('close') ||
+    item.label.includes('tutup') ||
+    item.label.includes('关闭') ||
+    item.label.trim() === 'x' ||
+    (item.rect.top < dialogRect.top + 90 && item.rect.left > dialogRect.right - 90)
+  )) return 'closed';
+}
+return '';
+"""
+    try:
+        result = driver.execute_script(script)
+        closed = bool(result)
+        if closed:
+            if result == "discarded":
+                print("Discarded unrelated create-post draft dialog.", flush=True)
+            else:
+                print("Closed unrelated create-post dialog after wrong image input.", flush=True)
+            time.sleep(1)
+        return closed
+    except Exception:
+        return False
+
+
+def page_has_unrelated_post_dialog(driver) -> bool:
+    script = """
+return Array.from(document.querySelectorAll('[role="dialog"]')).some((dialog) => {
+  const rect = dialog.getBoundingClientRect();
+  const style = window.getComputedStyle(dialog);
+  if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') return false;
+  const text = (dialog.innerText || '').toLowerCase();
+  return (
+    (text.includes('buat postingan') || text.includes('create post')) &&
+    (text.includes('apa yang anda pikirkan') || text.includes("what's on your mind") || text.includes('tambahkan ke postingan'))
+  );
+});
+"""
+    try:
+        return bool(driver.execute_script(script))
+    except Exception:
+        return False
+
+
+def click_comment_photo_button(driver, comment_box=None) -> bool:
+    if comment_box is not None:
+        button = find_comment_photo_button(driver, comment_box)
+        if button is not None:
+            try:
+                button.click()
+                return True
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click();", button)
+                    return True
+                except Exception:
+                    pass
+        return False
+
     button_xpaths = [
-        "//*[@role='button' and (contains(@aria-label,'照片') or contains(@aria-label,'图片') or contains(@aria-label,'Photo') or contains(@aria-label,'photo') or contains(@aria-label,'Image') or contains(@aria-label,'image'))]",
-        "//*[@aria-label and (contains(@aria-label,'照片') or contains(@aria-label,'图片') or contains(@aria-label,'Photo') or contains(@aria-label,'photo') or contains(@aria-label,'Image') or contains(@aria-label,'image'))]",
+        "//*[@role='button' and (contains(@aria-label,'照片') or contains(@aria-label,'图片') or contains(@aria-label,'Photo') or contains(@aria-label,'photo') or contains(@aria-label,'Image') or contains(@aria-label,'image') or contains(@aria-label,'Foto') or contains(@aria-label,'foto') or contains(@aria-label,'Gambar') or contains(@aria-label,'gambar') or contains(@aria-label,'Kamera') or contains(@aria-label,'kamera'))]",
+        "//*[@aria-label and (contains(@aria-label,'照片') or contains(@aria-label,'图片') or contains(@aria-label,'Photo') or contains(@aria-label,'photo') or contains(@aria-label,'Image') or contains(@aria-label,'image') or contains(@aria-label,'Foto') or contains(@aria-label,'foto') or contains(@aria-label,'Gambar') or contains(@aria-label,'gambar') or contains(@aria-label,'Kamera') or contains(@aria-label,'kamera'))]",
     ]
     for xpath in button_xpaths:
         for button in driver.find_elements(By.XPATH, xpath):
@@ -621,8 +1282,15 @@ def applescript_quote(value: str) -> str:
 
 
 def copy_image_to_clipboard(image_path: Path) -> bool:
+    if sys.platform.startswith("linux"):
+        process = start_x11_image_clipboard_provider(image_path)
+        if process is None:
+            return False
+        cleanup_clipboard_provider(process)
+        return True
+
     if sys.platform != "darwin":
-        print("Clipboard image paste is currently implemented for macOS only.", flush=True)
+        print("Clipboard image paste is currently implemented for macOS and Linux/X11 only.", flush=True)
         return False
 
     left_guillemet = chr(0x00AB)
@@ -655,67 +1323,998 @@ def copy_image_to_clipboard(image_path: Path) -> bool:
     return True
 
 
+def image_png_bytes_for_clipboard(image_path: Path) -> bytes | None:
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists():
+        print(f"Clipboard image not found: {path}", flush=True)
+        return None
+
+    try:
+        from PIL import Image
+    except ImportError:
+        if path.suffix.lower() == ".png":
+            return path.read_bytes()
+        print("Pillow is required to copy non-PNG images to the Linux clipboard.", flush=True)
+        return None
+
+    max_side = env_int("COMMENT_CLIPBOARD_IMAGE_MAX_SIDE", 768, 256, 2048)
+    try:
+        with Image.open(path) as image:
+            image.load()
+            original_size = image.size
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA")
+            if max(image.size) > max_side:
+                image.thumbnail((max_side, max_side))
+            output = BytesIO()
+            image.save(output, format="PNG", optimize=True, compress_level=6)
+            data = output.getvalue()
+            print(
+                "Prepared image for X11 clipboard: "
+                f"{path.name} {original_size[0]}x{original_size[1]} -> {image.size[0]}x{image.size[1]} "
+                f"({len(data)} bytes PNG)",
+                flush=True,
+            )
+            return data
+    except Exception as exc:
+        print(f"Could not prepare image for clipboard: {exc}", flush=True)
+        return None
+
+
+def start_x11_image_clipboard_provider(image_path: Path) -> subprocess.Popen | None:
+    content = image_png_bytes_for_clipboard(image_path)
+    if not content:
+        return None
+    try:
+        process = subprocess.Popen(
+            ["xclip", "-selection", "clipboard", "-target", "image/png", "-in", "-loops", "50", "-quiet"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        print(f"Could not start X11 image clipboard provider: {exc}", flush=True)
+        return None
+
+    try:
+        assert process.stdin is not None
+        process.stdin.write(content)
+        process.stdin.close()
+    except OSError as exc:
+        cleanup_clipboard_provider(process)
+        print(f"Could not write image to X11 clipboard provider: {exc}", flush=True)
+        return None
+
+    time.sleep(0.2)
+    if process.poll() is not None:
+        stderr = ""
+        try:
+            stderr = (process.stderr.read() if process.stderr else b"").decode("utf-8", errors="replace").strip()
+        except OSError:
+            stderr = ""
+        print(f"X11 image clipboard provider exited before paste: {stderr[:800]}", flush=True)
+        return None
+    print(f"Copied image to X11 clipboard: {Path(image_path).name} ({len(content)} bytes PNG)", flush=True)
+    return process
+
+
+def prepare_comment_upload_image(image_path: Path) -> Path:
+    path = Path(image_path).expanduser().resolve()
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+
+    output_dir = Path(tempfile.gettempdir()) / "metaflow_comment_uploads"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{path.stem}.jpg"
+    try:
+        with Image.open(path) as image:
+            image.load()
+            if image.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                alpha = image.getchannel("A") if image.mode == "RGBA" else image.getchannel("A")
+                background.paste(image.convert("RGBA"), mask=alpha)
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            max_dimension = env_int("COMMENT_UPLOAD_MAX_DIMENSION", 600, 320, 1600)
+            if max(image.size) > max_dimension:
+                image.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+            # Facebook comments can silently ignore some generated 1024px images.
+            # A small baseline JPEG is more reliable for comment attachments.
+            image.save(output_path, format="JPEG", quality=85, optimize=False, progressive=False)
+        if output_path != path:
+            print(f"Prepared upload-safe comment image: {path.name} -> {output_path.name}", flush=True)
+        return output_path
+    except Exception as exc:
+        print(f"Could not prepare upload-safe comment image, using original: {exc}", flush=True)
+        return path
+
+
+def comment_image_attachment_state(driver, comment_box) -> dict:
+    script = """
+const box = arguments[0];
+const boxRect = box.getBoundingClientRect();
+let root = box;
+let best = box.parentElement || box;
+for (let i = 0; i < 12 && root.parentElement; i++) {
+  root = root.parentElement;
+  const rect = root.getBoundingClientRect();
+  if (rect.width >= boxRect.width && rect.height >= boxRect.height && rect.height <= 1000) {
+    best = root;
+  }
+  if (rect.height > 1200) break;
+}
+root = best;
+
+const isVisible = (el) => {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  return rect.width >= 48 && rect.height >= 48 &&
+    style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0;
+};
+const isNearComposer = (el) => {
+  const rect = el.getBoundingClientRect();
+  const vertical = rect.bottom >= boxRect.top - 260 && rect.top <= boxRect.bottom + 320;
+  const horizontal = rect.right >= boxRect.left - 120 && rect.left <= boxRect.right + 220;
+  return vertical && horizontal;
+};
+const isProbablyAvatar = (el) => {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  const label = [
+    el.getAttribute('alt') || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.closest('[aria-label]')?.getAttribute('aria-label') || ''
+  ].join(' ').toLowerCase();
+  const radius = parseFloat(style.borderTopLeftRadius || '0') || 0;
+  const circular = radius >= Math.min(rect.width, rect.height) * 0.45;
+  const squareSmall = Math.abs(rect.width - rect.height) <= 4 && rect.width <= 72;
+  if (label.includes('profile') || label.includes('avatar') || label.includes('个人资料') || label.includes('头像')) return true;
+  return circular && squareSmall && rect.left < boxRect.left + 30;
+};
+const candidates = [];
+for (const img of Array.from(root.querySelectorAll('img'))) {
+  const src = (img.getAttribute('src') || '').toLowerCase();
+  if (!isVisible(img) || !isNearComposer(img) || isProbablyAvatar(img)) continue;
+  if (src.includes('/emoji') || src.includes('emoji.php') || src.includes('static.xx.fbcdn.net/images/emoji')) continue;
+  candidates.push(img);
+}
+for (const el of Array.from(root.querySelectorAll('[style*="background-image"]'))) {
+  const style = window.getComputedStyle(el);
+  if (!style.backgroundImage || style.backgroundImage === 'none') continue;
+  if (!isVisible(el) || !isNearComposer(el) || isProbablyAvatar(el)) continue;
+  candidates.push(el);
+}
+const busyNodes = Array.from(root.querySelectorAll('[role="progressbar"], [aria-busy="true"]'));
+const rootText = (root.innerText || '').toLowerCase();
+const busyText = [
+  'uploading', 'processing', 'attaching', 'finishing',
+  '正在上传', '上传中', '处理中', '正在处理'
+].some((term) => rootText.includes(term));
+const busy = busyText || busyNodes.some((el) => {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+});
+return {
+  previewCount: candidates.length,
+  busy,
+  rootText: (root.innerText || '').slice(0, 300)
+};
+"""
+    try:
+        state = driver.execute_script(script, comment_box) or {}
+        return {
+            "previewCount": int(state.get("previewCount") or 0),
+            "busy": bool(state.get("busy")),
+            "rootText": str(state.get("rootText") or ""),
+        }
+    except StaleElementReferenceException:
+        try:
+            fresh_box = wait_visible_comment_box(driver, 5)
+            return comment_image_attachment_state(driver, fresh_box)
+        except Exception:
+            return {"previewCount": 0, "busy": False, "rootText": ""}
+    except Exception:
+        return {"previewCount": 0, "busy": False, "rootText": ""}
+
+
+def wait_for_comment_image_ready(
+    driver,
+    comment_box,
+    baseline_count: int = 0,
+    timeout: int | None = None,
+    require_new_preview: bool = True,
+) -> bool:
+    wait_seconds = timeout
+    if wait_seconds is None:
+        wait_seconds = env_int("COMMENT_IMAGE_READY_WAIT_SECONDS", 35, 5, 120)
+    stable_required = env_int("COMMENT_IMAGE_READY_STABLE_CHECKS", 3, 1, 8)
+    deadline = time.time() + wait_seconds
+    stable_count = 0
+    last_state = {"previewCount": 0, "busy": False, "rootText": ""}
+    while time.time() <= deadline:
+        last_state = comment_image_attachment_state(driver, comment_box)
+        preview_count = int(last_state.get("previewCount") or 0)
+        has_preview = preview_count > baseline_count if require_new_preview else preview_count > 0
+        if has_preview and not last_state.get("busy"):
+            stable_count += 1
+            if stable_count >= stable_required:
+                print(
+                    "Comment image preview is ready: "
+                    f"previews={preview_count} baseline={baseline_count} stable_checks={stable_count}",
+                    flush=True,
+                )
+                return True
+        else:
+            stable_count = 0
+        time.sleep(1)
+
+    print(
+        "Timed out waiting for comment image preview/upload readiness: "
+        f"last_state={last_state} baseline={baseline_count} require_new_preview={require_new_preview}",
+        flush=True,
+    )
+    return False
+
+
 def paste_image_from_clipboard(driver, comment_box, image_path: Path, timeout: int) -> bool:
-    if not copy_image_to_clipboard(image_path):
+    baseline_count = comment_image_attachment_state(driver, comment_box).get("previewCount", 0)
+    clipboard_process = None
+    if sys.platform.startswith("linux"):
+        clipboard_process = start_x11_image_clipboard_provider(image_path)
+        if clipboard_process is None:
+            return False
+    elif not copy_image_to_clipboard(image_path):
         return False
+
+    pasted = False
+    try:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
+            comment_box.click()
+        except Exception:
+            focus_comment_box(driver, comment_box)
+        if sys.platform.startswith("linux"):
+            click_element_with_xdotool(driver, comment_box)
+            try:
+                result = subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    print("Image paste Ctrl+V sent with xdotool.", flush=True)
+                else:
+                    output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+                    print(f"xdotool image paste failed, trying CDP Ctrl+V: {output[:500]}", flush=True)
+                    raise RuntimeError("xdotool paste failed")
+            except Exception as xdotool_exc:
+                print(f"Could not paste image with xdotool, trying CDP Ctrl+V: {xdotool_exc}", flush=True)
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyDown",
+                    "key": "Control",
+                    "code": "ControlLeft",
+                    "windowsVirtualKeyCode": 17,
+                    "nativeVirtualKeyCode": 17,
+                    "modifiers": 2,
+                })
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyDown",
+                    "key": "v",
+                    "code": "KeyV",
+                    "windowsVirtualKeyCode": 86,
+                    "nativeVirtualKeyCode": 86,
+                    "modifiers": 2,
+                })
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyUp",
+                    "key": "v",
+                    "code": "KeyV",
+                    "windowsVirtualKeyCode": 86,
+                    "nativeVirtualKeyCode": 86,
+                    "modifiers": 2,
+                })
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyUp",
+                    "key": "Control",
+                    "code": "ControlLeft",
+                    "windowsVirtualKeyCode": 17,
+                    "nativeVirtualKeyCode": 17,
+                })
+        else:
+            modifier = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
+            ActionChains(driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
+        pasted = True
+    except Exception as exc:
+        print(f"Could not paste image from clipboard: {exc}", flush=True)
+        return False
+    finally:
+        # If paste failed before Ctrl+V, stop the clipboard provider now. On a
+        # successful paste, keep it alive through the preview wait because Chrome
+        # can request image bytes asynchronously after probing clipboard targets.
+        if clipboard_process is not None and not pasted:
+            time.sleep(3)
+            cleanup_clipboard_provider(clipboard_process)
+
+    try:
+        if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count):
+            print("Image pasted from clipboard and preview/upload is ready.", flush=True)
+            return True
+        screenshot_path = "comment_image_paste_not_ready.png"
+        driver.save_screenshot(screenshot_path)
+        print(f"Image paste did not produce a ready preview. Saved screenshot: {screenshot_path}", flush=True)
+        return False
+    finally:
+        cleanup_clipboard_provider(clipboard_process)
+
+
+def paste_image_with_chromium_clipboard(driver, comment_box, image_path: Path, timeout: int) -> bool:
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists():
+        print(f"Comment image not found for Chromium clipboard copy: {path}", flush=True)
+        return False
+
+    if not sys.platform.startswith("linux"):
+        return False
+
+    baseline_count = comment_image_attachment_state(driver, comment_box).get("previewCount", 0)
+    original_handle = driver.current_window_handle
+    image_handle = None
+    try:
+        driver.switch_to.new_window("tab")
+        image_handle = driver.current_window_handle
+        driver.get(path.as_uri())
+        WebDriverWait(driver, 10).until(
+            lambda current_driver: current_driver.execute_script(
+                "const img = document.querySelector('img'); return !!img && img.complete && img.naturalWidth > 0;"
+            )
+        )
+        try:
+            image_element = driver.find_element(By.CSS_SELECTOR, "img")
+            click_element_with_xdotool(driver, image_element)
+        except Exception as exc:
+            print(f"Could not focus Chromium image tab with xdotool, continuing: {exc}", flush=True)
+        try:
+            driver.execute_cdp_cmd(
+                "Browser.grantPermissions",
+                {"permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]},
+            )
+        except Exception as exc:
+            print(f"Could not grant Chromium clipboard permission, continuing: {exc}", flush=True)
+
+        result = driver.execute_async_script(
+            """
+const done = arguments[arguments.length - 1];
+(async function() {
+  try {
+    const img = document.querySelector('img');
+    if (!img || !img.complete || !img.naturalWidth) {
+      done({ok: false, error: 'image-not-loaded'});
+      return;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    canvas.toBlob(async (blob) => {
+      try {
+        if (!blob) {
+          done({ok: false, error: 'canvas-to-blob-failed'});
+          return;
+        }
+        const item = new ClipboardItem({'image/png': blob});
+        await navigator.clipboard.write([item]);
+        done({
+          ok: true,
+          type: blob.type,
+          size: blob.size,
+          secure: window.isSecureContext,
+          hasClipboard: !!navigator.clipboard
+        });
+      } catch (error) {
+        done({
+          ok: false,
+          error: String(error && error.name ? error.name + ': ' + error.message : error),
+          secure: window.isSecureContext,
+          hasClipboard: !!navigator.clipboard
+        });
+      }
+    }, 'image/png');
+  } catch (error) {
+    done({
+      ok: false,
+      error: String(error && error.name ? error.name + ': ' + error.message : error),
+      secure: window.isSecureContext,
+      hasClipboard: !!navigator.clipboard
+    });
+  }
+})();
+"""
+        ) or {}
+        print(f"Chromium image clipboard write result: {result}", flush=True)
+        if not result.get("ok"):
+            return False
+    except Exception as exc:
+        print(f"Could not copy image through Chromium clipboard API: {exc}", flush=True)
+        return False
+    finally:
+        try:
+            if image_handle and image_handle in driver.window_handles:
+                driver.switch_to.window(image_handle)
+                driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(original_handle)
+        except Exception:
+            pass
 
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
         comment_box.click()
-        modifier = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
-        ActionChains(driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
+    except Exception:
+        try:
+            focus_comment_box(driver, comment_box)
+        except Exception:
+            pass
+    click_element_with_xdotool(driver, comment_box)
+    try:
+        result = subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     except Exception as exc:
-        print(f"Could not paste image from clipboard: {exc}", flush=True)
+        print(f"Could not paste Chromium-copied image with xdotool: {exc}", flush=True)
+        return False
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        print(f"xdotool paste of Chromium-copied image failed: {output[:500]}", flush=True)
+        return False
+    print("Chromium-copied image pasted with xdotool Ctrl+V.", flush=True)
+
+    if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count, timeout=min(max(timeout, 15), 45)):
+        print("Image copied through Chromium clipboard and preview/upload is ready.", flush=True)
+        return True
+    screenshot_path = "comment_image_chromium_clipboard_not_ready.png"
+    driver.save_screenshot(screenshot_path)
+    print(f"Chromium clipboard paste did not produce a ready preview. Saved screenshot: {screenshot_path}", flush=True)
+    return False
+
+
+def paste_image_with_chromium_context_copy(driver, comment_box, image_path: Path, timeout: int) -> bool:
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists() or not sys.platform.startswith("linux"):
         return False
 
-    time.sleep(min(max(timeout / 4, 3), 8))
-    print("Image pasted from clipboard; continuing after preview wait.", flush=True)
+    baseline_count = comment_image_attachment_state(driver, comment_box).get("previewCount", 0)
+    original_handle = driver.current_window_handle
+    image_handle = None
+    try:
+        driver.switch_to.new_window("tab")
+        image_handle = driver.current_window_handle
+        driver.get(path.as_uri())
+        WebDriverWait(driver, 10).until(
+            lambda current_driver: current_driver.execute_script(
+                "var im = document.querySelector('img'); return !!im && im.complete && im.naturalWidth > 0;"
+            )
+        )
+        image_element = driver.find_element(By.CSS_SELECTOR, "img")
+        click_element_with_xdotool(driver, image_element)
+        coords = driver.execute_script(
+            """
+	const rect = arguments[0].getBoundingClientRect();
+	return [
+	  Math.round(Math.max(window.screenX || 0, 0) + rect.left + rect.width / 2),
+	  Math.round(Math.max(window.screenY || 0, 0) + rect.top + rect.height / 2)
+	];
+	""",
+            image_element,
+        )
+        subprocess.run(
+            ["xdotool", "mousemove", str(int(coords[0])), str(int(coords[1])), "click", "3"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        time.sleep(0.5)
+        # In Chromium's image context menu this selects "Copy image".
+        subprocess.run(
+            ["xdotool", "key", "Down", "Down", "Down", "Return"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        time.sleep(1)
+        targets = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        print(
+            "Chromium context-menu copy targets: "
+            + ", ".join(line for line in targets.splitlines() if line)[:500],
+            flush=True,
+        )
+        if "image/png" not in targets and "text/html" not in targets:
+            return False
+    except Exception as exc:
+        print(f"Could not copy image through Chromium context menu: {exc}", flush=True)
+        return False
+    finally:
+        try:
+            subprocess.run(["xdotool", "key", "Escape"], check=False, capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+        try:
+            if image_handle and image_handle in driver.window_handles:
+                driver.switch_to.window(image_handle)
+                driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(original_handle)
+        except Exception:
+            pass
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
+        comment_box.click()
+    except Exception:
+        try:
+            focus_comment_box(driver, comment_box)
+        except Exception:
+            pass
+    click_element_with_xdotool(driver, comment_box)
+    try:
+        result = subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"Could not paste Chromium context-copied image: {exc}", flush=True)
+        return False
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        print(f"xdotool paste of Chromium context-copied image failed: {output[:500]}", flush=True)
+        return False
+    print("Chromium context-copied image pasted with xdotool Ctrl+V.", flush=True)
+
+    if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count, timeout=min(max(timeout, 15), 45)):
+        print("Image copied through Chromium context menu and preview/upload is ready.", flush=True)
+        return True
+    screenshot_path = "comment_image_chromium_context_copy_not_ready.png"
+    driver.save_screenshot(screenshot_path)
+    print(f"Chromium context-menu paste did not produce a ready preview. Saved screenshot: {screenshot_path}", flush=True)
+    return False
+
+
+def click_element_with_xdotool(driver, element) -> bool:
+    script = """
+const el = arguments[0];
+el.scrollIntoView({block: 'center'});
+const rect = el.getBoundingClientRect();
+const x = Math.round(Math.max(window.screenX || 0, 0) + rect.left + rect.width / 2);
+const y = Math.round(Math.max(window.screenY || 0, 0) + rect.top + rect.height / 2);
+return {x, y, rect: {left: rect.left, top: rect.top, width: rect.width, height: rect.height}, screenX: window.screenX, screenY: window.screenY, outerHeight: window.outerHeight, innerHeight: window.innerHeight};
+"""
+    try:
+        coords = driver.execute_script(script, element) or {}
+        x = int(coords.get("x") or 0)
+        y = int(coords.get("y") or 0)
+    except Exception as exc:
+        print(f"Could not calculate xdotool click coordinates: {exc}", flush=True)
+        return False
+    if x <= 0 or y <= 0:
+        print(f"Invalid xdotool click coordinates: {coords}", flush=True)
+        return False
+    try:
+        result = subprocess.run(
+            ["xdotool", "mousemove", str(x), str(y), "click", "1"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"Could not click comment box with xdotool: {exc}", flush=True)
+        return False
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        print(f"xdotool click failed: {output[:500]}", flush=True)
+        return False
+    print(f"Comment box clicked with xdotool at ({x}, {y}).", flush=True)
+    time.sleep(0.4)
     return True
 
 
-def attach_image_with_file_input(driver, image_path: Path, timeout: int) -> bool:
+def paste_image_with_dom_event(driver, comment_box, image_path: Path, timeout: int) -> bool:
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists():
+        print(f"Comment image not found for DOM paste: {path}", flush=True)
+        return False
+
+    suffix = path.suffix.lower()
+    mime = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+    try:
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError as exc:
+        print(f"Could not read image for DOM paste: {exc}", flush=True)
+        return False
+
+    baseline_count = comment_image_attachment_state(driver, comment_box).get("previewCount", 0)
+    script = """
+const box = arguments[0];
+const name = arguments[1];
+const mime = arguments[2];
+const b64 = arguments[3];
+const done = arguments[arguments.length - 1];
+try {
+  box.scrollIntoView({block: 'center'});
+  box.focus();
+  const range = document.createRange();
+  range.selectNodeContents(box);
+  range.collapse(false);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const file = new File([bytes], name, {type: mime, lastModified: Date.now()});
+  const dt = new DataTransfer();
+  dt.items.add(file);
+
+  const event = new Event('paste', {bubbles: true, cancelable: true, composed: true});
+  Object.defineProperty(event, 'clipboardData', {value: dt});
+  Object.defineProperty(event, 'dataTransfer', {value: dt});
+  const dispatched = box.dispatchEvent(event);
+  done({ok: true, dispatched, files: dt.files.length, target: box.tagName});
+} catch (error) {
+  done({ok: false, error: String(error && error.message ? error.message : error)});
+}
+"""
+    try:
+        result = driver.execute_async_script(script, comment_box, path.name, mime, encoded) or {}
+        print(f"DOM paste event result: {result}", flush=True)
+    except Exception as exc:
+        print(f"Could not dispatch DOM paste event for image: {exc}", flush=True)
+        return False
+
+    if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count, timeout=min(max(timeout, 15), 45)):
+        print("Image pasted with DOM paste event and preview/upload is ready.", flush=True)
+        return True
+    screenshot_path = "comment_image_dom_paste_not_ready.png"
+    driver.save_screenshot(screenshot_path)
+    print(f"DOM paste event did not produce a ready preview. Saved screenshot: {screenshot_path}", flush=True)
+    return False
+
+
+def set_file_input_with_cdp(driver, file_input, path: Path) -> bool:
+    marker = f"metaflow-upload-{uuid.uuid4().hex}"
+    try:
+        driver.execute_script("arguments[0].dataset.metaflowUploadMarker = arguments[1];", file_input, marker)
+        document = driver.execute_cdp_cmd("DOM.getDocument", {"depth": 0, "pierce": True})
+        root_id = document.get("root", {}).get("nodeId")
+        if not root_id:
+            return False
+        node = driver.execute_cdp_cmd(
+            "DOM.querySelector",
+            {"nodeId": root_id, "selector": f'input[type="file"][data-metaflow-upload-marker="{marker}"]'},
+        )
+        node_id = node.get("nodeId")
+        if not node_id:
+            return False
+        driver.execute_cdp_cmd("DOM.setFileInputFiles", {"nodeId": node_id, "files": [str(path)]})
+        state = driver.execute_script(
+            """
+const el = arguments[0];
+for (const name of ['input', 'change']) {
+  el.dispatchEvent(new Event(name, {bubbles: true, cancelable: true, composed: true}));
+}
+return {files: el.files ? el.files.length : 0, value: el.value || ''};
+""",
+            file_input,
+        )
+        print(f"Set comment image file input through Chrome DevTools: {state}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"Could not set file input through Chrome DevTools: {exc}", flush=True)
+        return False
+
+
+def set_file_input_by_id_with_cdp(driver, input_id: str, path: Path) -> bool:
+    if not input_id:
+        return False
+    selector = f'input[type="file"][data-metaflow-file-input-id="{input_id}"]'
+    try:
+        document = driver.execute_cdp_cmd("DOM.getDocument", {"depth": 0, "pierce": True})
+        root_id = document.get("root", {}).get("nodeId")
+        if not root_id:
+            return False
+        node = driver.execute_cdp_cmd("DOM.querySelector", {"nodeId": root_id, "selector": selector})
+        node_id = node.get("nodeId")
+        if not node_id:
+            return False
+        driver.execute_cdp_cmd("DOM.setFileInputFiles", {"nodeId": node_id, "files": [str(path)]})
+        expression = f"""
+(() => {{
+  const el = document.querySelector({json.dumps(selector)});
+  if (!el) return {{files: -1, value: ''}};
+  for (const name of ['input', 'change']) {{
+    el.dispatchEvent(new Event(name, {{bubbles: true, cancelable: true, composed: true}}));
+  }}
+  return {{files: el.files ? el.files.length : 0, value: el.value || ''}};
+}})()
+"""
+        state = driver.execute_cdp_cmd("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+        value = state.get("result", {}).get("value")
+        print(f"Set comment image file input through Chrome DevTools by id={input_id}: {value}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"Could not set file input through Chrome DevTools by id={input_id}: {exc}", flush=True)
+        return False
+
+
+def attach_image_with_file_input(driver, image_path: Path, timeout: int, comment_box=None) -> bool:
     path = Path(image_path).expanduser().resolve()
     if not path.exists():
         print(f"Comment image not found: {path}", flush=True)
         return False
 
+    try:
+        if comment_box is None:
+            comment_box = wait_visible_comment_box(driver, 5)
+        baseline_count = comment_image_attachment_state(driver, comment_box).get("previewCount", 0)
+    except Exception:
+        baseline_count = 0
+
     print(f"Attaching image to comment: {path}", flush=True)
-    file_input = find_file_input(driver)
-    if file_input is None:
-        click_comment_photo_button(driver)
+    closed_dialog = False
+    for _ in range(3):
+        if not close_unrelated_post_dialog(driver):
+            break
+        closed_dialog = True
+    if closed_dialog:
         try:
-            file_input = WebDriverWait(driver, 5).until(
-                lambda current_driver: find_file_input(current_driver)
+            comment_box = wait_visible_comment_box(driver, 10)
+            baseline_count = comment_image_attachment_state(driver, comment_box).get("previewCount", 0)
+        except Exception:
+            pass
+
+    button_candidates = find_comment_photo_buttons(driver, comment_box) if comment_box is not None else []
+    if not button_candidates and comment_box is None:
+        click_comment_photo_button(driver, None)
+        try:
+            file_inputs = WebDriverWait(driver, 5).until(lambda current_driver: find_file_inputs_by_ids(current_driver, set()))
+        except TimeoutException:
+            file_inputs = []
+        button_candidates = []
+    else:
+        file_inputs = []
+
+    tried_any_input = False
+    if button_candidates:
+        print(f"Found {len(button_candidates)} nearby comment photo button candidate(s).", flush=True)
+
+    # Try each nearby comment toolbar button separately. This avoids sending the
+    # image to Facebook's unrelated "Create post" file input.
+    for button_index, button in enumerate(button_candidates, start=1):
+        close_unrelated_post_dialog(driver)
+        known_inputs = known_file_input_ids(driver)
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+            time.sleep(0.2)
+            try:
+                button.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", button)
+            print(f"Clicked comment photo button candidate {button_index}/{len(button_candidates)}.", flush=True)
+        except Exception as exc:
+            print(f"Could not click comment photo button candidate {button_index}: {exc}", flush=True)
+            continue
+
+        try:
+            file_inputs = WebDriverWait(driver, 5).until(
+                lambda current_driver: find_file_inputs_by_ids(current_driver, known_inputs, comment_box)
             )
         except TimeoutException:
-            file_input = None
+            file_inputs = []
 
-    if file_input is None:
+        if not file_inputs:
+            if attach_image_with_native_file_dialog(driver, button, comment_box, path, baseline_count):
+                return True
+            continue
+
+        for input_index, file_input in enumerate(file_inputs, start=1):
+            tried_any_input = True
+            try:
+                metadata = driver.execute_script(
+                    "return {accept: arguments[0].accept || '', id: arguments[0].dataset.metaflowFileInputId || ''};",
+                    file_input,
+                )
+            except Exception:
+                metadata = {}
+            print(
+                "Trying comment image file input "
+                f"{input_index}/{len(file_inputs)} from button {button_index}/{len(button_candidates)}: {metadata}",
+                flush=True,
+            )
+            try:
+                driver.execute_script(
+                    "arguments[0].style.display='block'; arguments[0].style.visibility='visible'; arguments[0].style.opacity=1;",
+                    file_input,
+                )
+            except Exception:
+                pass
+
+            input_id = str(metadata.get("id") or "") if isinstance(metadata, dict) else ""
+            if not set_file_input_by_id_with_cdp(driver, input_id, path) and not set_file_input_with_cdp(
+                driver, file_input, path
+            ):
+                try:
+                    file_input.send_keys(str(path))
+                except Exception as exc:
+                    print(f"Could not send image path to file input {input_index}: {exc}", flush=True)
+                    continue
+
+            if page_has_unrelated_post_dialog(driver):
+                close_unrelated_post_dialog(driver)
+                try:
+                    comment_box = wait_visible_comment_box(driver, 8)
+                except TimeoutException:
+                    pass
+                print("File input opened the create-post composer, not the comment uploader; trying next candidate.", flush=True)
+                continue
+
+            try:
+                comment_box = wait_visible_comment_box(driver, min(max(timeout // 3, 5), 15))
+            except TimeoutException:
+                pass
+            if comment_box is None:
+                screenshot_path = "comment_box_after_image_upload_not_found.png"
+                driver.save_screenshot(screenshot_path)
+                print(f"Could not find comment box after image upload. Saved screenshot: {screenshot_path}", flush=True)
+                return False
+            if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count, timeout=25):
+                print("Image attached to comment and preview/upload is ready.", flush=True)
+                return True
+            print("File input did not attach a ready comment image; trying next candidate if available.", flush=True)
+            close_unrelated_post_dialog(driver)
+
+    if button_candidates:
+        screenshot_path = "comment_image_upload_not_ready.png"
+        driver.save_screenshot(screenshot_path)
+        detail = "after trying nearby comment photo button candidates"
+        print(f"Image upload did not produce a ready preview {detail}. Saved screenshot: {screenshot_path}", flush=True)
+        return False
+
+    if not file_inputs:
+        button = find_comment_photo_button(driver, comment_box) if comment_box is not None else None
+        if button is not None and attach_image_with_native_file_dialog(driver, button, comment_box, path, baseline_count):
+            return True
         screenshot_path = "comment_image_input_not_found.png"
         driver.save_screenshot(screenshot_path)
         print(f"Could not find a file input for comment image. Saved screenshot: {screenshot_path}", flush=True)
         return False
 
-    try:
-        driver.execute_script(
-            "arguments[0].style.display='block'; arguments[0].style.visibility='visible'; arguments[0].style.opacity=1;",
-            file_input,
-        )
-    except Exception:
-        pass
+    for index, file_input in enumerate(file_inputs, start=1):
+        tried_any_input = True
+        try:
+            metadata = driver.execute_script(
+                "return {accept: arguments[0].accept || '', id: arguments[0].dataset.metaflowFileInputId || ''};",
+                file_input,
+            )
+        except Exception:
+            metadata = {}
+        print(f"Trying comment image file input {index}/{len(file_inputs)}: {metadata}", flush=True)
+        try:
+            driver.execute_script(
+                "arguments[0].style.display='block'; arguments[0].style.visibility='visible'; arguments[0].style.opacity=1;",
+                file_input,
+            )
+        except Exception:
+            pass
 
+        input_id = str(metadata.get("id") or "") if isinstance(metadata, dict) else ""
+        if not set_file_input_by_id_with_cdp(driver, input_id, path) and not set_file_input_with_cdp(
+            driver, file_input, path
+        ):
+            try:
+                file_input.send_keys(str(path))
+            except Exception as exc:
+                print(f"Could not send image path to file input {index}: {exc}", flush=True)
+                continue
+
+        if page_has_unrelated_post_dialog(driver):
+            close_unrelated_post_dialog(driver)
+            try:
+                comment_box = wait_visible_comment_box(driver, 8)
+            except TimeoutException:
+                pass
+            print("File input opened the create-post composer, not the comment uploader; trying next candidate.", flush=True)
+            continue
+
+        try:
+            comment_box = wait_visible_comment_box(driver, min(max(timeout // 3, 5), 15))
+        except TimeoutException:
+            pass
+        if comment_box is None:
+            screenshot_path = "comment_box_after_image_upload_not_found.png"
+            driver.save_screenshot(screenshot_path)
+            print(f"Could not find comment box after image upload. Saved screenshot: {screenshot_path}", flush=True)
+            return False
+        if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count, timeout=25):
+            print("Image attached to comment and preview/upload is ready.", flush=True)
+            return True
+        print(f"File input {index} did not attach a ready comment image; trying next candidate if available.", flush=True)
+
+    screenshot_path = "comment_image_upload_not_ready.png"
+    driver.save_screenshot(screenshot_path)
+    detail = "after trying file inputs" if tried_any_input else "because no comment file input was found"
+    print(f"Image upload did not produce a ready preview {detail}. Saved screenshot: {screenshot_path}", flush=True)
+    return False
+
+
+def attach_image_with_native_file_dialog(driver, button, comment_box, path: Path, baseline_count: int) -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    print("Trying native file dialog upload via xdotool.", flush=True)
     try:
-        file_input.send_keys(str(path))
+        if not click_element_with_xdotool(driver, button):
+            return False
+        time.sleep(2.5)
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+l"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        time.sleep(0.2)
+        subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "1", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        time.sleep(0.3)
+        subprocess.run(
+            ["xdotool", "key", "Return"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     except Exception as exc:
-        screenshot_path = "comment_image_upload_failed.png"
-        driver.save_screenshot(screenshot_path)
-        print(f"Could not upload comment image: {exc}. Saved screenshot: {screenshot_path}", flush=True)
+        print(f"Could not drive native file dialog: {exc}", flush=True)
         return False
 
-    # Give Facebook a moment to render the uploaded preview before submission.
-    time.sleep(min(max(timeout / 4, 3), 8))
-    print("Image attached to comment; continuing after preview wait.", flush=True)
-    return True
+    if wait_for_comment_image_ready(driver, comment_box, baseline_count=baseline_count, timeout=45):
+        print("Image attached through native file dialog and preview/upload is ready.", flush=True)
+        return True
+    screenshot_path = "comment_image_native_dialog_not_ready.png"
+    driver.save_screenshot(screenshot_path)
+    print(f"Native file dialog upload did not produce a ready preview. Saved screenshot: {screenshot_path}", flush=True)
+    return False
 
 
 def attach_image_to_comment(driver, comment_box, image_path: str, timeout: int) -> bool:
@@ -723,16 +2322,336 @@ def attach_image_to_comment(driver, comment_box, image_path: str, timeout: int) 
     if not path.exists():
         print(f"Comment image not found: {path}", flush=True)
         return False
+    path = prepare_comment_upload_image(path)
 
-    attach_mode = os.getenv("COMMENT_IMAGE_ATTACH_MODE", "paste").strip().lower()
+    attach_mode = os.getenv("COMMENT_IMAGE_ATTACH_MODE", "auto").strip().lower()
     if attach_mode in {"paste", "clipboard", "auto"}:
         if paste_image_from_clipboard(driver, comment_box, path, timeout):
             return True
+        print("X11 clipboard image paste was not ready; trying Chromium context-menu copy/paste.", flush=True)
+        if paste_image_with_chromium_context_copy(driver, comment_box, path, timeout):
+            return True
+        print("Chromium context-menu paste was not ready; trying Chromium clipboard API copy/paste.", flush=True)
+        if paste_image_with_chromium_clipboard(driver, comment_box, path, timeout):
+            return True
         if attach_mode in {"paste", "clipboard"}:
             return False
+        print("Chromium clipboard paste was not ready; trying DOM paste event.", flush=True)
 
-    return attach_image_with_file_input(driver, path, timeout)
+    if attach_mode in {"dom", "dom-paste", "auto"}:
+        if paste_image_with_dom_event(driver, comment_box, path, timeout):
+            return True
+        if attach_mode in {"dom", "dom-paste"}:
+            return False
+        print("DOM paste event was not ready; falling back to file input upload.", flush=True)
 
+    return attach_image_with_file_input(driver, path, timeout, comment_box=comment_box)
+
+
+def find_comment_submit_button(driver, comment_box):
+    script = """
+const box = arguments[0];
+const exactLabels = new Set(['send', 'kirim', 'post', 'submit', 'comment', 'komentar']);
+const allowed = ['send', 'kirim', 'submit', 'comment', 'komentar'];
+const blocked = [
+  'avatar', 'sticker', 'stiker', 'gif', 'emoji', 'emoticon',
+  'photo', 'foto', 'gambar', 'image', 'attach', 'attachment', 'lampir',
+  'action', 'tindakan', 'menu', 'more', 'lainnya', 'posting-an', 'postingan',
+  'shop', 'seedsunrise', 'share', 'bagikan', 'save', 'simpan'
+];
+const boxRect = box.getBoundingClientRect();
+let root = box;
+for (let i = 0; i < 8 && root.parentElement; i++) {
+  root = root.parentElement;
+  const rect = root.getBoundingClientRect();
+  if (rect.width >= boxRect.width && rect.height > boxRect.height && rect.height < 420) break;
+}
+const items = Array.from(root.querySelectorAll('[role="button"], button'))
+  .map((el) => {
+    const rect = el.getBoundingClientRect();
+    const label = [
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.innerText || ''
+    ].join(' ').toLowerCase().trim();
+    const style = window.getComputedStyle(el);
+    const disabled = el.getAttribute('aria-disabled') === 'true' || el.disabled;
+    return {el, rect, label, style, disabled};
+  })
+  .filter((item) => {
+    if (item.disabled || item.style.visibility === 'hidden' || item.style.display === 'none') return false;
+    if (item.rect.width < 8 || item.rect.height < 8) return false;
+    if (blocked.some((label) => item.label.includes(label))) return false;
+    if (!allowed.some((label) => item.label === label || item.label.includes(label))) return false;
+    const nearY = Math.abs((item.rect.top + item.rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2) < 140;
+    const nearX = item.rect.left > boxRect.left - 30 && item.rect.left < boxRect.right + 180;
+    return nearY && nearX;
+  })
+  .sort((a, b) => {
+    const aExact = exactLabels.has(a.label.trim()) ? 0 : 1;
+    const bExact = exactLabels.has(b.label.trim()) ? 0 : 1;
+    if (aExact !== bExact) return aExact - bExact;
+    const ay = Math.abs((a.rect.top + a.rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2);
+    const by = Math.abs((b.rect.top + b.rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2);
+    if (Math.abs(ay - by) > 8) return ay - by;
+    return b.rect.left - a.rect.left;
+  });
+return items.length ? items[0].el : null;
+"""
+    try:
+        return driver.execute_script(script, comment_box)
+    except Exception:
+        return None
+
+
+def comment_box_text(driver, comment_box) -> str:
+    try:
+        value = driver.execute_script(
+            "return (arguments[0].innerText || arguments[0].textContent || '').trim();",
+            comment_box,
+        )
+        return str(value or "").strip()
+    except StaleElementReferenceException:
+        return ""
+    except Exception:
+        return ""
+
+
+def normalize_comment_probe(value: str) -> str:
+    return " ".join((value or "").replace("\xa0", " ").split()).strip()
+
+
+def repair_comment_text_encoding(value: str) -> str:
+    replacements = {
+        "â\x80\x99": "'",
+        "â€™": "'",
+        "â\x80\x98": "'",
+        "â€˜": "'",
+        "â\x80\x9c": '"',
+        "â€œ": '"',
+        "â\x80\x9d": '"',
+        "â€\x9d": '"',
+        "â\x80\x93": "-",
+        "â€“": "-",
+        "â\x80\x94": "-",
+        "â€”": "-",
+        "â\x80¦": "...",
+        "â€¦": "...",
+        "Â\xa0": " ",
+        "Â ": " ",
+    }
+    repaired = value or ""
+    for old, new in replacements.items():
+        repaired = repaired.replace(old, new)
+    return repaired
+
+
+def comment_text_visible(driver, comment_box, comment_text: str) -> bool:
+    actual = normalize_comment_probe(comment_box_text(driver, comment_box))
+    expected = normalize_comment_probe(repair_comment_text_encoding(comment_text))
+    return bool(expected and actual and (expected in actual or actual in expected))
+
+
+def focus_comment_box(driver, comment_box) -> None:
+    driver.execute_script(
+        """
+arguments[0].scrollIntoView({block: 'center'});
+arguments[0].focus();
+const range = document.createRange();
+range.selectNodeContents(arguments[0]);
+range.collapse(false);
+const selection = window.getSelection();
+selection.removeAllRanges();
+selection.addRange(range);
+""",
+        comment_box,
+    )
+
+
+def insert_comment_text_with_cdp(driver, comment_box, comment_text: str) -> bool:
+    try:
+        focus_comment_box(driver, comment_box)
+        driver.execute_cdp_cmd("Input.insertText", {"text": comment_text})
+        time.sleep(0.8)
+    except Exception as exc:
+        print(f"Could not insert comment text with CDP: {exc}", flush=True)
+        return False
+    if comment_text_visible(driver, comment_box, comment_text):
+        print("Comment text inserted with CDP.", flush=True)
+        return True
+    print(f"CDP insert did not appear in comment box. Current text={comment_box_text(driver, comment_box)!r}", flush=True)
+    return False
+
+
+def page_contains_comment_text(driver, comment_text: str) -> bool:
+    expected = normalize_comment_probe(repair_comment_text_encoding(comment_text))
+    if not expected:
+        return False
+    try:
+        body_text = driver.execute_script("return document.body ? document.body.innerText : '';")
+    except Exception:
+        return False
+    body = normalize_comment_probe(repair_comment_text_encoding(str(body_text or "")))
+    return expected in body
+
+
+def wait_before_comment_submit(driver, comment_box, comment_text: str) -> None:
+    wait_seconds = env_int("COMMENT_BEFORE_SUBMIT_WAIT_SECONDS", 5, 0, 30)
+    if wait_seconds > 0:
+        print(f"Waiting {wait_seconds}s before submit so Facebook can render text/image...", flush=True)
+    deadline = time.time() + wait_seconds
+    last_text = ""
+    stable_visible_count = 0
+    while time.time() <= deadline:
+        current = comment_box_text(driver, comment_box)
+        visible = comment_text_visible(driver, comment_box, comment_text)
+        if visible and normalize_comment_probe(current) == normalize_comment_probe(last_text):
+            stable_visible_count += 1
+        elif visible:
+            stable_visible_count = 1
+        else:
+            stable_visible_count = 0
+        last_text = current
+        time.sleep(1)
+
+    if not comment_text_visible(driver, comment_box, comment_text):
+        print(
+            f"Comment text is not visible immediately before submit. Current composer text={comment_box_text(driver, comment_box)!r}. "
+            "Trying CDP insertText again.",
+            flush=True,
+        )
+        insert_comment_text_with_cdp(driver, comment_box, comment_text)
+        time.sleep(1)
+
+    before_text = comment_box_text(driver, comment_box)
+    print(
+        "Before submit composer check: "
+        f"visible={comment_text_visible(driver, comment_box, comment_text)} "
+        f"stable_checks={stable_visible_count} text={before_text!r}",
+        flush=True,
+    )
+    screenshot_path = "before_comment_submit.png"
+    driver.save_screenshot(screenshot_path)
+    print(f"Saved before-submit screenshot: {screenshot_path}", flush=True)
+    focus_comment_box(driver, comment_box)
+    time.sleep(0.5)
+
+
+def submit_comment_with_enter(driver, comment_box) -> bool:
+    try:
+        focus_comment_box(driver, comment_box)
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        })
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyUp",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        })
+        print("Comment submit Enter sent with CDP.", flush=True)
+        return True
+    except Exception as exc:
+        print(f"Could not send Enter with CDP, trying Selenium Enter: {exc}", flush=True)
+
+    try:
+        focus_comment_box(driver, comment_box)
+        comment_box.send_keys(Keys.ENTER)
+        print("Comment submit Enter sent.", flush=True)
+        return True
+    except Exception as exc:
+        print(f"Could not send Enter to comment box directly, trying active element: {exc}", flush=True)
+        try:
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+            print("Comment submit Enter sent to active element.", flush=True)
+            return True
+        except Exception as active_exc:
+            print(f"Could not submit with Enter: {active_exc}", flush=True)
+            return False
+
+
+def submit_comment(driver, comment_box, comment_text: str, image_required: bool = False) -> None:
+    wait_seconds = env_int("COMMENT_POST_SUBMIT_WAIT_SECONDS", 20, 3, 60)
+    wait_before_comment_submit(driver, comment_box, comment_text)
+    if image_required and not wait_for_comment_image_ready(driver, comment_box, require_new_preview=False):
+        screenshot_path = "comment_image_missing_before_submit.png"
+        driver.save_screenshot(screenshot_path)
+        raise RuntimeError(
+            "Comment image preview was not ready immediately before submit, so I did not submit. "
+            f"Saved screenshot: {screenshot_path}"
+        )
+    submitted = False
+    if image_required:
+        button = find_comment_submit_button(driver, comment_box)
+        if button is not None:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+                button.click()
+                print("Comment submit button clicked for image comment.", flush=True)
+                submitted = True
+            except Exception as exc:
+                print(f"Could not click image comment submit button, trying Enter: {exc}", flush=True)
+
+    if not submitted:
+        submitted = submit_comment_with_enter(driver, comment_box)
+    if not submitted:
+        button = find_comment_submit_button(driver, comment_box)
+        if button is not None:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+                button.click()
+                print("Comment submit button clicked.", flush=True)
+                submitted = True
+            except Exception as exc:
+                print(f"Could not click comment submit button normally, trying JavaScript click: {exc}", flush=True)
+                try:
+                    driver.execute_script("arguments[0].click();", button)
+                    print("Comment submit button clicked with JavaScript.", flush=True)
+                    submitted = True
+                except Exception as js_exc:
+                    print(f"Could not click comment submit button: {js_exc}", flush=True)
+        if not submitted:
+            raise RuntimeError("Could not submit the Facebook comment.")
+
+    print(f"Waiting {wait_seconds}s for Facebook to finish submitting the comment...", flush=True)
+    time.sleep(wait_seconds)
+    try:
+        fresh_comment_box = wait_visible_comment_box(driver, 5)
+    except TimeoutException:
+        fresh_comment_box = comment_box
+    composer_still_has_text = comment_text_visible(driver, fresh_comment_box, comment_text)
+    if page_contains_comment_text(driver, comment_text) and not composer_still_has_text:
+        print("Comment submitted and found on page.", flush=True)
+        return
+    if composer_still_has_text:
+        screenshot_path = "comment_submit_unverified.png"
+        driver.save_screenshot(screenshot_path)
+        raise RuntimeError(
+            "Comment text still appears in the composer after submit; "
+            f"Facebook may not have accepted it yet. Saved screenshot: {screenshot_path}"
+        )
+    if page_contains_comment_text(driver, comment_text):
+        print("Comment submitted and found on page.", flush=True)
+    else:
+        screenshot_path = "comment_submit_not_found.png"
+        driver.save_screenshot(screenshot_path)
+        if not env_bool("COMMENT_STRICT_SUBMIT_VERIFY", False):
+            print(
+                "Comment composer cleared after submit, but the exact submitted text was not found on the page. "
+                "Treating as submitted because Facebook accepted/cleared the composer. "
+                f"Saved screenshot for review: {screenshot_path}",
+                flush=True,
+            )
+            return
+        raise RuntimeError(
+            "Comment composer cleared, but the submitted comment text was not found on the page. "
+            f"Saved screenshot: {screenshot_path}"
+        )
 
 def copy_text_to_clipboard(text: str) -> bool:
     if sys.platform == "darwin":
@@ -755,24 +2674,145 @@ def copy_text_to_clipboard(text: str) -> bool:
             return False
         return True
 
-    print("Clipboard text paste is currently implemented for macOS only.", flush=True)
+    if sys.platform.startswith("linux"):
+        process = start_x11_clipboard_provider(text)
+        if process is None:
+            return False
+        cleanup_clipboard_provider(process)
+        return True
+
+    print("Clipboard text paste is currently implemented for macOS and Linux/X11 only.", flush=True)
     return False
+
+
+def start_x11_clipboard_provider(text: str) -> subprocess.Popen | None:
+    try:
+        process = subprocess.Popen(
+            ["xclip", "-selection", "clipboard", "-in", "-loops", "5", "-quiet"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        print(f"Could not start X11 clipboard provider: {exc}", flush=True)
+        return None
+
+    try:
+        assert process.stdin is not None
+        process.stdin.write(text.encode("utf-8"))
+        process.stdin.close()
+    except OSError as exc:
+        cleanup_clipboard_provider(process)
+        print(f"Could not write comment text to X11 clipboard provider: {exc}", flush=True)
+        return None
+
+    # xclip remains alive while it owns the selection. More than one loop is
+    # needed because Chrome/X11 may probe clipboard formats before the paste.
+    time.sleep(0.2)
+    if process.poll() is not None:
+        stderr = ""
+        try:
+            stderr = (process.stderr.read() if process.stderr else b"").decode("utf-8", errors="replace").strip()
+        except OSError:
+            stderr = ""
+        print(f"X11 clipboard provider exited before paste: {stderr[:800]}", flush=True)
+        return None
+    return process
+
+
+def cleanup_clipboard_provider(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def paste_comment_text_from_clipboard(driver, comment_box, comment_text: str) -> bool:
+    clipboard_process = None
+    copied = False
+    if sys.platform.startswith("linux"):
+        clipboard_process = start_x11_clipboard_provider(comment_text)
+        copied = clipboard_process is not None
+    else:
+        copied = copy_text_to_clipboard(comment_text)
+
+    if not copied:
+        return False
+
+    try:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
+            comment_box.click()
+        except Exception:
+            focus_comment_box(driver, comment_box)
+        modifier = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
+        ActionChains(driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
+        time.sleep(0.5)
+        print("Comment text pasted from clipboard.", flush=True)
+        return True
+    finally:
+        cleanup_clipboard_provider(clipboard_process)
 
 
 def type_comment_text(driver, comment_box, comment_text: str) -> None:
     input_mode = os.getenv("COMMENT_TEXT_INPUT_MODE", "paste").strip().lower()
-    if input_mode in {"paste", "clipboard", "auto"} and copy_text_to_clipboard(comment_text):
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
-        comment_box.click()
-        modifier = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
-        ActionChains(driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
-        print("Comment text pasted from clipboard.", flush=True)
+    if input_mode in {"paste", "clipboard", "auto"} and paste_comment_text_from_clipboard(
+        driver, comment_box, comment_text
+    ):
         return
 
     if input_mode in {"paste", "clipboard"}:
         raise RuntimeError("Could not paste comment text from clipboard.")
 
-    comment_box.send_keys(comment_text)
+    comment_box.send_keys(selenium_safe_text(comment_text))
+
+
+def type_comment_text_verified(driver, comment_box, comment_text: str) -> None:
+    try:
+        type_comment_text(driver, comment_box, comment_text)
+    except RuntimeError as exc:
+        print(f"Clipboard/send_keys text input failed: {exc}. Trying CDP insertText.", flush=True)
+        if insert_comment_text_with_cdp(driver, comment_box, comment_text):
+            return
+        raise
+    time.sleep(0.8)
+    if comment_text_visible(driver, comment_box, comment_text):
+        print(f"Comment text verified in composer: {comment_text!r}", flush=True)
+        return
+
+    print(
+        f"Comment text was not visible after paste/send_keys. Current composer text={comment_box_text(driver, comment_box)!r}. "
+        "Trying CDP insertText.",
+        flush=True,
+    )
+    if insert_comment_text_with_cdp(driver, comment_box, comment_text):
+        return
+
+    raise RuntimeError("Comment text was not inserted into the Facebook composer.")
+
+
+def selenium_safe_text(value: str) -> str:
+    replacements = {
+        "â\x80\x99": "'",
+        "â\x80\x98": "'",
+        "â\x80\x9c": '"',
+        "â\x80\x9d": '"',
+        "â\x80\x93": "-",
+        "â\x80\x94": "-",
+        "❤️": "❤",
+    }
+    cleaned = value or ""
+    for old, new in replacements.items():
+        cleaned = cleaned.replace(old, new)
+    # ChromeDriver send_keys cannot type non-BMP characters such as modern emoji.
+    cleaned = "".join(ch for ch in cleaned if ord(ch) <= 0xFFFF)
+    return " ".join(cleaned.split()).strip()
 
 
 def comment_on_post(
@@ -783,42 +2823,63 @@ def comment_on_post(
     confirm: bool,
     submit: bool,
     image_path: str | None = None,
+    wait_login_if_needed: bool = False,
+    login_wait_timeout: int = 300,
 ) -> None:
+    repaired_comment_text = repair_comment_text_encoding(comment_text)
+    if repaired_comment_text != comment_text:
+        print(f"Repaired comment text encoding: {repaired_comment_text!r}", flush=True)
+        comment_text = repaired_comment_text
+
     print(f"Opening post page: {post_url}", flush=True)
     driver.get(post_url)
 
     print("Waiting for comment box...", flush=True)
     try:
-        ensure_logged_in_before_comment(driver)
+        ensure_logged_in_before_comment(
+            driver,
+            wait_if_needed=wait_login_if_needed,
+            post_url=post_url,
+            wait_timeout=login_wait_timeout,
+        )
     except RuntimeError as exc:
         print(str(exc), flush=True)
-        return
+        raise
+
+    for _ in range(3):
+        if not close_unrelated_post_dialog(driver):
+            break
 
     try:
-        comment_box = wait_first_clickable(driver, DEFAULT_COMMENT_BOX_LOCATORS, timeout)
+        comment_box = wait_visible_comment_box(driver, timeout)
     except TimeoutException:
         screenshot_path = "comment_box_not_found.png"
         driver.save_screenshot(screenshot_path)
-        print(f"Could not find a comment box. Saved screenshot: {screenshot_path}")
-        return
+        raise RuntimeError(f"Could not find a comment box. Saved screenshot: {screenshot_path}")
 
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", comment_box)
     comment_box.click()
-    try:
-        type_comment_text(driver, comment_box, comment_text)
-    except RuntimeError as exc:
-        screenshot_path = "comment_text_input_failed.png"
-        driver.save_screenshot(screenshot_path)
-        print(f"{exc} Saved screenshot: {screenshot_path}", flush=True)
-        return
-    print(f"Comment text typed: {comment_text!r}", flush=True)
 
     image_attached = False
     if image_path:
         image_attached = attach_image_to_comment(driver, comment_box, image_path, timeout)
         if not image_attached:
-            print("Image was not attached, so the comment was left typed without submitting.", flush=True)
-            return
+            raise RuntimeError("Image was not attached, so the comment was not submitted.")
+        # Facebook may rerender the composer after image upload, so type text after attachment.
+        try:
+            comment_box = wait_visible_comment_box(driver, timeout)
+        except TimeoutException as exc:
+            screenshot_path = "comment_box_after_image_not_found.png"
+            driver.save_screenshot(screenshot_path)
+            raise RuntimeError(f"Could not find comment box after image upload. Saved screenshot: {screenshot_path}") from exc
+
+    try:
+        type_comment_text_verified(driver, comment_box, comment_text)
+    except RuntimeError as exc:
+        screenshot_path = "comment_text_input_failed.png"
+        driver.save_screenshot(screenshot_path)
+        raise RuntimeError(f"{exc} Saved screenshot: {screenshot_path}") from exc
+    print(f"Comment text typed: {comment_text!r}", flush=True)
 
     should_submit = submit
     if confirm and not submit:
@@ -829,8 +2890,7 @@ def comment_on_post(
         should_submit = answer.strip().lower() in {"y", "yes"}
 
     if should_submit:
-        comment_box.send_keys(Keys.ENTER)
-        print("Comment submitted.", flush=True)
+        submit_comment(driver, comment_box, comment_text, image_required=bool(image_path))
     else:
         print("Comment left typed in the browser without submitting.", flush=True)
 
@@ -916,6 +2976,8 @@ def main() -> None:
     parser.add_argument("--submit-comment", action="store_true", help="Submit the comment without an extra prompt.")
     parser.add_argument("--no-confirm-comment", action="store_true", help="Do not ask before submitting/leaving the comment.")
     parser.add_argument("--skip-login", action="store_true", help="Skip the login form and use the current Chrome profile session.")
+    parser.add_argument("--wait-login-if-needed", action="store_true", help="If the browser is logged out, wait for manual login and then continue.")
+    parser.add_argument("--login-only", action="store_true", help="Open the account Chrome profile and wait for manual Facebook login.")
     args = parser.parse_args()
 
     load_dotenv(args.env)
@@ -957,6 +3019,8 @@ def main() -> None:
     submit_comment = args.submit_comment or env_bool("SUBMIT_COMMENT", True)
     confirm_comment = not args.no_confirm_comment and env_bool("CONFIRM_BEFORE_COMMENT", False)
     skip_login = args.skip_login or env_bool("SKIP_LOGIN", False)
+    wait_login_if_needed = args.wait_login_if_needed or env_bool("WAIT_LOGIN_IF_NEEDED", False)
+    login_wait_timeout = int(os.getenv("MANUAL_LOGIN_TIMEOUT_SECONDS", "300"))
     if ai_product_promo and not post_url:
         raise ValueError("AI_PRODUCT_PROMO requires POST_URL or --post-url.")
     image_only = bool(
@@ -979,15 +3043,20 @@ def main() -> None:
 
     username = os.getenv("LOGIN_USERNAME", "")
     password = os.getenv("LOGIN_PASSWORD", "")
-    if not skip_login:
+    if not skip_login and not args.login_only:
         username = required_env("LOGIN_USERNAME")
         password = required_env("LOGIN_PASSWORD")
         validate_credentials(username, password)
 
+    print(f"MetaFlow auto_login version: {APP_CODE_VERSION}", flush=True)
     print("Starting Chrome with Selenium...", flush=True)
     driver = build_driver(profile_dir=profile_dir, headless=headless)
 
     try:
+        if args.login_only:
+            wait_for_manual_login(driver, login_url, login_wait_timeout)
+            return
+
         login_submitted = False
         if skip_login:
             print("Skipping login form and using the current browser session.", flush=True)
@@ -1030,10 +3099,17 @@ def main() -> None:
                     post_url=post_url,
                     timeout=timeout,
                     product_url=product_url,
+                    wait_login_if_needed=wait_login_if_needed,
+                    login_wait_timeout=login_wait_timeout,
                 )
             else:
                 post_content = extract_post_content(driver, post_url, timeout)
-                ensure_logged_in_before_comment(driver)
+                ensure_logged_in_before_comment(
+                    driver,
+                    wait_if_needed=wait_login_if_needed,
+                    post_url=post_url,
+                    wait_timeout=login_wait_timeout,
+                )
                 print("\nExtracted post content preview:")
                 print("-" * 40)
                 print(post_content[:1200] or "<empty>")
@@ -1068,11 +3144,14 @@ def main() -> None:
                 if result.get("rationale"):
                     print(f"Draft rationale: {result['rationale']}", flush=True)
 
+                composition_name, composition_instruction = choose_product_photo_composition()
+                print(f"Product image composition: {composition_name}", flush=True)
                 product_prompt = build_product_scene_image_prompt(
                     post_content=post_content,
                     product_context=product_context,
                     use_cases=product_use_cases,
                     style=image_style,
+                    composition=f"{composition_name}: {composition_instruction}",
                 )
                 reference_urls = extract_image_urls_from_context(product_context)
                 if not reference_urls:
@@ -1112,6 +3191,8 @@ def main() -> None:
                     confirm=confirm_comment,
                     submit=submit_comment,
                     image_path=output_path,
+                    wait_login_if_needed=wait_login_if_needed,
+                    login_wait_timeout=login_wait_timeout,
                 )
             except Exception:
                 return_to_post(driver, post_url)
@@ -1136,6 +3217,8 @@ def main() -> None:
                 timeout=timeout,
                 confirm=confirm_comment,
                 submit=submit_comment,
+                wait_login_if_needed=wait_login_if_needed,
+                login_wait_timeout=login_wait_timeout,
             )
 
         generated_image = False
@@ -1161,6 +3244,8 @@ def main() -> None:
                 confirm=confirm_comment,
                 submit=submit_comment,
                 image_path=comment_image,
+                wait_login_if_needed=wait_login_if_needed,
+                login_wait_timeout=login_wait_timeout,
             )
         elif not ai_comment and not ai_product_promo and not generated_image and (post_url or comment_text):
             print("POST_URL and COMMENT_TEXT must both be set to comment on a post.")

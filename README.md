@@ -47,6 +47,112 @@ python auto_login.py
 python auto_login.py --skip-login
 ```
 
+## 可视化前端
+
+可以启动本地 Web 控制台，通过页面输入 Facebook 帖子链接并选择账号执行。默认会选择全部账号，默认模式是“评论 + 图片”。
+
+```bash
+source .venv/bin/activate
+python web_app.py
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8765
+```
+
+页面支持：
+
+- 输入帖子链接，例如 `https://www.facebook.com/61550584116226/posts/122291256464019470/`
+- 默认勾选所有 `accounts.json` 里的账号
+- 也可以只勾选指定账号
+- 选择“评论 + 图片”或“只生成评论”
+- 可选填写产品链接，适合帖子里识别不到落地页链接时使用
+- 在页面里查看每个账号的执行日志
+
+前端后台实际会顺序调用现有脚本，例如：
+
+```bash
+python auto_login.py --account account2 --post-url "帖子链接" --ai-product-promo --skip-login
+```
+
+为了避免在 Web 任务里卡住终端输入，`web_app.py` 默认会给任务加 `--skip-login`，也就是优先使用已保存的 Chrome 登录状态。同时也会加 `--wait-login-if-needed`：如果某个账号已经退出登录，浏览器会停住等你手动登录，检测到登录成功后会自动回到帖子继续执行。
+
+如果你确实要让 Web 任务走账号密码登录流程，可以启动时加：
+
+```bash
+python web_app.py --no-skip-login
+```
+
+也可以指定端口：
+
+```bash
+python web_app.py --port 8888
+```
+
+## Docker 部署
+
+Docker 版本会同时启动 Web 控制台、Chrome 图形环境和 noVNC。用户第一次登录账号时，可以通过浏览器访问 noVNC 来操作容器里的 Chrome。
+
+1. 准备配置文件：
+
+```bash
+cp .env.example .env
+cp accounts.docker.example.json accounts.json
+mkdir -p chrome-profiles generated output
+```
+
+2. 编辑 `accounts.json`，每个账号使用独立的 `profile_dir`：
+
+```json
+{
+  "accounts": {
+    "main": {
+      "username": "your_email_or_phone",
+      "password": "your_password",
+      "profile_dir": "./chrome-profiles/main",
+      "skip_login": true
+    }
+  }
+}
+```
+
+3. 启动：
+
+```bash
+docker compose up -d --build
+```
+
+4. 打开控制台：
+
+```text
+http://127.0.0.1:8765
+```
+
+5. 第一次登录账号：
+
+- 先打开 noVNC：`http://127.0.0.1:7900/vnc.html`
+- 回到控制台，点击某个账号旁边的“登录”
+- 在 noVNC 里的 Chrome 完成 Facebook 登录/验证
+- 登录状态会保存到 `./chrome-profiles/<account>`，后续任务会复用
+
+6. 平时执行：
+
+- 输入 Facebook 帖子链接
+- 选择账号
+- 选择“评论 + 图片”或“只生成评论”
+- 点击“开始执行”
+
+注意：
+
+- 不建议定时自动重新登录；更稳的是掉线后点“登录”重新验证一次。
+- 多账号会顺序执行，不会同时打开多个账号浏览器，避免抢 profile 和触发异常。
+- Docker 里建议账号的 `profile_dir` 都放在 `./chrome-profiles/...`，这样重启容器后登录状态还在。
+- 如果你本机 `.env` 里有 `HTTP_PROXY=http://127.0.0.1:xxxx`，容器里不能直接用这个地址；Docker 代理请改用 `DOCKER_HTTP_PROXY=http://host.docker.internal:xxxx` 和 `DOCKER_HTTPS_PROXY=http://host.docker.internal:xxxx`。
+- 如果服务器外网访问必须走代理，需要同时配置 `DOCKER_HTTP_PROXY` / `DOCKER_HTTPS_PROXY` 和 `CHROME_PROXY_*`。前者让 Python 请求走代理，后者让容器里的 Chrome/Facebook 访问走代理；带用户名密码的代理请用 `CHROME_PROXY_USERNAME` / `CHROME_PROXY_PASSWORD`。
+- 如果部署到服务器，把 `8765` 作为平台端口，把 `7900` 作为远程登录浏览器端口，并做好访问权限控制。
+
 ## 登录后评论
 
 可以用命令行参数打开指定帖子，并输入评论：
@@ -82,16 +188,16 @@ SUBMIT_COMMENT=true
 python auto_login.py --skip-login --post-url "https://www.facebook.com/61550584116226/posts/122290195820019470/" --comment "good" --comment-image generated/product_scene.png
 ```
 
-默认会用 macOS 剪贴板方式粘贴图片，类似你手动复制图片后在评论框里按 `Command+V`：
-
-```env
-COMMENT_IMAGE_ATTACH_MODE=paste
-```
-
-如果你想回到文件上传 input 方式，可以改成：
+默认使用 Facebook 评论框的图片/相机按钮上传，并等待图片预览/上传状态稳定：
 
 ```env
 COMMENT_IMAGE_ATTACH_MODE=file
+```
+
+如果你想改回先尝试剪贴板粘贴、失败再回退上传，可以改成：
+
+```env
+COMMENT_IMAGE_ATTACH_MODE=auto
 ```
 
 ## 获取帖子内容并用 AI 生成评论草稿

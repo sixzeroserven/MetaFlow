@@ -1,0 +1,44 @@
+services:
+  metaflow:
+    build: .
+    container_name: metaflow
+    shm_size: "2gb"
+    ports:
+      - "8765:8765"
+      - "7900:7900"
+    env_file:
+      - .env
+    environment:
+      ACCOUNTS_FILE: accounts.json
+      ENV_FILE: .env
+      WEB_PORT: "8765"
+      SERVER_WORKER_ENABLED: "true"
+      SERVER_WORKER_ID: server
+      SERVER_ENABLE_BROWSER_LOGIN: "true"
+      HEADLESS: "false"
+      KEEP_BROWSER_OPEN: "false"
+      COMMENT_TEXT_INPUT_MODE: paste
+      COMMENT_IMAGE_ATTACH_MODE: file
+      CHROME_BINARY: /usr/bin/chromium
+      CHROME_EXTRA_ARGS: "--no-sandbox||--disable-dev-shm-usage||--disable-gpu||--window-size=1440,1100"
+      CHROME_PROXY_SCHEME: ${CHROME_PROXY_SCHEME:-http}
+      CHROME_PROXY_HOST: ${CHROME_PROXY_HOST:-}
+      CHROME_PROXY_PORT: ${CHROME_PROXY_PORT:-}
+      CHROME_PROXY_USERNAME: ${CHROME_PROXY_USERNAME:-}
+      CHROME_PROXY_PASSWORD: ${CHROME_PROXY_PASSWORD:-}
+      CHROME_PROXY_BYPASS: ${CHROME_PROXY_BYPASS:-localhost,127.0.0.1,::1}
+      NO_PROXY: localhost,127.0.0.1,::1
+      no_proxy: localhost,127.0.0.1,::1
+    volumes:
+      - ./accounts.json:/app/accounts.json
+      - ./.env:/app/.env
+      - ./auto_login.py:/app/auto_login.py
+      - ./web_app.py:/app/web_app.py
+      - ./worker.py:/app/worker.py
+      - ./openai_content_client.py:/app/openai_content_client.py
+      - ./imagegen_cli.py:/app/imagegen_cli.py
+      - ./local_image_generator.py:/app/local_image_generator.py
+      - ./chrome-profiles:/app/chrome-profiles
+      - ./generated:/app/generated
+      - ./output:/app/output
+    restart: unless-stopped

@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+accounts.json
+chrome-profile*
+chrome-profiles
+comment_box_not_found.png
+login_field_not_found.png
+not_logged_in.png
+generated
+output

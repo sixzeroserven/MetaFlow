@@ -6,6 +6,8 @@ __pycache__/
 *.pyc
 chrome-profile/
 chrome-profile-*/
+chrome-profiles/
 generated/
+output/
 login_check_failed.png
 *_not_found.png

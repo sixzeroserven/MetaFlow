@@ -1,4 +1,5 @@
 import base64
+import difflib
 import json
 import mimetypes
 import os
@@ -498,6 +499,92 @@ class OpenAIContentClient:
                 time.sleep(min(5.0, attempt * 1.5))
         return "", None
 
+    def _comment_history_path(self) -> Path:
+        raw = (os.getenv("AI_COMMENT_HISTORY_FILE") or "generated/recent_ai_comments.json").strip()
+        return Path(raw).expanduser()
+
+    def _load_recent_comments(self, limit: int) -> list[str]:
+        path = self._comment_history_path()
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+
+        items = payload if isinstance(payload, list) else payload.get("comments", [])
+        results: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                value = str(item.get("comment") or "").strip()
+            else:
+                value = str(item or "").strip()
+            if value:
+                results.append(value)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _remember_comment(self, comment: str) -> None:
+        normalized = normalize_comment(comment)
+        if not normalized:
+            return
+        path = self._comment_history_path()
+        limit = env_int("AI_COMMENT_HISTORY_LIMIT", 40, 8, 200)
+        existing = self._load_recent_comments(limit)
+        deduped = [normalized]
+        normalized_key = self._comment_similarity_key(normalized)
+        for item in existing:
+            if self._comment_similarity_key(item) == normalized_key:
+                continue
+            deduped.append(item)
+            if len(deduped) >= limit:
+                break
+        payload = {"comments": [{"comment": item} for item in deduped]}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not persist comment history: {exc}", flush=True)
+
+    @staticmethod
+    def _comment_similarity_key(comment: str) -> str:
+        lowered = re.sub(r"\s+", " ", (comment or "").strip().lower())
+        lowered = re.sub(r"[^\w\u4e00-\u9fff ]+", "", lowered)
+        return lowered.strip()
+
+    def _comment_similarity_score(self, left: str, right: str) -> float:
+        left_key = self._comment_similarity_key(left)
+        right_key = self._comment_similarity_key(right)
+        if not left_key or not right_key:
+            return 0.0
+        ratio = difflib.SequenceMatcher(None, left_key, right_key).ratio()
+        left_tokens = set(left_key.split())
+        right_tokens = set(right_key.split())
+        token_score = 0.0
+        if left_tokens and right_tokens:
+            token_score = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+        if (" " not in left_key or " " not in right_key) and left_key and right_key:
+            char_score = len(set(left_key) & set(right_key)) / max(1, len(set(left_key) | set(right_key)))
+            token_score = max(token_score, char_score)
+        return max(ratio, token_score)
+
+    def _comment_is_too_similar(self, comment: str, recent_comments: list[str]) -> bool:
+        threshold_raw = (os.getenv("AI_COMMENT_SIMILARITY_THRESHOLD") or "0.72").strip()
+        try:
+            threshold = float(threshold_raw)
+        except ValueError:
+            threshold = 0.72
+        for existing in recent_comments:
+            score = self._comment_similarity_score(comment, existing)
+            if score >= threshold:
+                print(
+                    f"Generated comment is too similar to recent history score={score:.2f}: {comment!r} ~ {existing!r}",
+                    flush=True,
+                )
+                return True
+        return False
+
     def generate_comment(self, post_content: str, language: str, style: str) -> Optional[Dict[str, str]]:
         text = (post_content or "").strip()
         if not text or not self.ready():
@@ -506,42 +593,58 @@ class OpenAIContentClient:
         if cache_key in self.comment_cache:
             return self.comment_cache[cache_key]
 
-        prompt = (
-            "你是社交媒体评论草稿助手。根据帖子和产品信息生成一条简短、真实、自然的心情式评论。\n"
-            "只能输出 JSON，不要解释。\n\n"
-            "要求：\n"
-            "- 评论要像普通人刷到产品后随手写的一句，不要像 AI、客服、品牌号、广告语或精修文案。\n"
-            "- 语气随意一点，有生活气，可以用 &、缩写、口语、轻微不完整句，允许一点点小错字或不完美表达。\n"
-            "- 更偏短而有力的夸法：好看 & 实用、pretty & useful、cute & practical、nice & easy、looks handy 这类感觉。\n"
-            "- 优先表达两个简单优点，例如好看+实用、顺眼+省事、漂亮+方便、颜色好+好打理。\n"
-            "- 不要自己输出 emoji；程序会在最后本地追加一个能表达情绪的表情，避免 Facebook 显示乱码。\n"
-            "- 评论要表达看到产品后的即时感受，也可以自然带到一个适合的生活场景，但不要硬凑满所有元素。\n"
-            "- 不要直接照搬链接、URL、产品标题里的关键词或完整产品名；要换成自己的理解和自然说法。\n"
-            "- 可以用泛称或改写，例如 this porch piece、these flowers、this decor、this little setup、门口这个小装饰、这组花。\n"
-            "- 评论重点是自己的感受和理解，不是复述标题、链接词、卖点词。\n"
-            "- 禁止和产品介绍高度重合：不要连续复用产品介绍里的短语，不要照搬卖点顺序，不要把标题/描述换几个词后当评论。\n"
-            "- 要有一句基础短描述，例如颜色、材质感、大小、造型、节日感、摆放效果、方便、省心、实用等，但不要展开介绍。\n"
-            "- 场景可以是门口、阳台、院子、厨房、客厅、通勤、周末、节日布置、送礼等，必须贴合帖子或产品。\n"
-            "- 可以写自己的摆放偏好或使用想法，例如 I'd put it by the door / I'd use it on the porch / 我会放门口。\n"
-            "- 可以写家人视角的推测，例如 my mom would like this / 家里人应该会喜欢；只有真实体验素材提供时，才写 my family likes it / 家人也喜欢。\n"
-            "- 可以自然使用 it / this / that，不用刻意说产品名；像平时聊天一样，例如 “it looks pretty easy to use”。\n"
-            "- 可以用“ngl...”“honestly...”“I'd put it...”“my mom would...”“it looks...”“it would...”“... kinda works for...”这类自然表达。\n"
-            "- 不要固定套用“产品简称 + 基础特点 + 场景 + 心情”的结构；这只是信息参考，不是模板。\n"
-            "- 不要长篇描述产品，不要堆功能和卖点。\n"
-            "- 英文评论不要以 The/the 开头，可以用 it、ngl、honestly、this、that、kinda、looks、would、so 等更随手的开头。\n"
-            "- 禁止使用 boom、mood handled、July mood、instantly cheerful、perfect for、must-have、game changer 这类 slogan/广告感表达。\n"
-            "- 每次都要换表达角度、开头、场景和用词，避免生成和常见模板差不多的评论。\n"
-            "- 只有当风格或真实体验素材明确提供时，才可以写 received/got/used/mine/my family likes/朋友家人夸/收到/实物/用起来/家人也喜欢 等亲历内容。\n"
-            "- 避免机械套话、官方腔、过度完美的形容词和感叹号堆砌。\n"
-            "- 不要伪装成亲历者，不要编造自己做过、买过、见过。\n"
-            "- 不要包含链接、广告、标签、诱导关注或批量营销语气。\n"
-            "- 保持简短，1 个短句，18 个英文词或 40 个中文字符以内。\n"
-            f"- 输出语言：{language}。\n"
-            f"- 风格：{style}。\n"
-            "- 输出格式必须是：{\"comment\":\"...\",\"rationale\":\"...\"}\n\n"
-            f"帖子/产品内容：\n{text[:6000]}"
-        )
+        recent_comments = self._load_recent_comments(env_int("AI_COMMENT_HISTORY_PROMPT_LIMIT", 8, 3, 20))
+
+        def build_prompt(extra_rule: str = "") -> str:
+            recent_comment_block = ""
+            if recent_comments:
+                recent_lines = "\n".join(f"  * {item}" for item in recent_comments)
+                recent_comment_block = (
+                    "- 下面这些是最近已经生成过的评论，禁止直接复用、轻微改写、只换 1-2 个词、沿用同样开头或同样句式：\n"
+                    f"{recent_lines}\n"
+                    "- 新评论必须和上面那些评论明显不同，至少换掉开头、场景词、形容词组合、句子节奏里的两项以上。\n"
+                )
+
+            return (
+                "你是社交媒体评论草稿助手。根据帖子和产品信息生成一条简短、真实、自然的心情式评论。\n"
+                "只能输出 JSON，不要解释。\n\n"
+                "要求：\n"
+                "- 评论要像普通人刷到产品后随手写的一句，不要像 AI、客服、品牌号、广告语或精修文案。\n"
+                "- 语气随意一点，有生活气，可以用 &、缩写、口语、轻微不完整句，允许一点点小错字或不完美表达。\n"
+                "- 更偏短而有力的夸法：好看 & 实用、pretty & useful、cute & practical、nice & easy、looks handy 这类感觉。\n"
+                "- 优先表达两个简单优点，例如好看+实用、顺眼+省事、漂亮+方便、颜色好+好打理。\n"
+                "- 不要自己输出 emoji；程序会在最后本地追加一个能表达情绪的表情，避免 Facebook 显示乱码。\n"
+                "- 评论要表达看到产品后的即时感受，也可以自然带到一个适合的生活场景，但不要硬凑满所有元素。\n"
+                "- 不要直接照搬链接、URL、产品标题里的关键词或完整产品名；要换成自己的理解和自然说法。\n"
+                "- 可以用泛称或改写，例如 this porch piece、these flowers、this decor、this little setup、门口这个小装饰、这组花、these little seedlings、that garden starter。\n"
+                "- 评论重点是自己的感受和理解，不是复述标题、链接词、卖点词。\n"
+                "- 禁止和产品介绍高度重合：不要连续复用产品介绍里的短语，不要照搬卖点顺序，不要把标题/描述换几个词后当评论。\n"
+                "- 要有一句基础短描述，例如颜色、材质感、大小、造型、节日感、摆放效果、方便、省心、实用、长势、活力、发芽状态、收获期待等，但不要展开介绍。\n"
+                "- 场景可以是门口、阳台、院子、厨房、客厅、通勤、周末、节日布置、送礼、花盆、菜园、花园边、育苗盘等，必须贴合帖子或产品。\n"
+                "- 可以写自己的摆放偏好或使用想法，例如 I'd put it by the door / I'd use it on the porch / 我会放门口 / I'd start this in a pot / 我会先种在小盆里。\n"
+                "- 可以写家人视角的推测，例如 my mom would like this / 家里人应该会喜欢；只有真实体验素材提供时，才写 my family likes it / 家人也喜欢。\n"
+                "- 可以自然使用 it / this / that，不用刻意说产品名；像平时聊天一样，例如 “it looks pretty easy to use”。\n"
+                "- 可以用“ngl...”“honestly...”“I'd put it...”“my mom would...”“it looks...”“it would...”“... kinda works for...”这类自然表达。\n"
+                "- 不要固定套用“产品简称 + 基础特点 + 场景 + 心情”的结构；这只是信息参考，不是模板。\n"
+                "- 不要长篇描述产品，不要堆功能和卖点。\n"
+                "- 英文评论不要以 The/the 开头，可以用 it、ngl、honestly、this、that、kinda、looks、would、so 等更随手的开头。\n"
+                "- 禁止使用 boom、mood handled、July mood、instantly cheerful、perfect for、must-have、game changer 这类 slogan/广告感表达。\n"
+                "- 每次都要换表达角度、开头、场景和用词，避免生成和常见模板差不多的评论。\n"
+                "- 只有当风格或真实体验素材明确提供时，才可以写 received/got/used/mine/my family likes/朋友家人夸/收到/实物/用起来/家人也喜欢 等亲历内容。\n"
+                "- 避免机械套话、官方腔、过度完美的形容词和感叹号堆砌。\n"
+                "- 不要伪装成亲历者，不要编造自己做过、买过、见过。\n"
+                "- 不要包含链接、广告、标签、诱导关注或批量营销语气。\n"
+                "- 保持简短，1 个短句，18 个英文词或 40 个中文字符以内。\n"
+                f"- 输出语言：{language}。\n"
+                f"- 风格：{style}。\n"
+                f"{recent_comment_block}"
+                f"{extra_rule}"
+                "- 输出格式必须是：{\"comment\":\"...\",\"rationale\":\"...\"}\n\n"
+                f"帖子/产品内容：\n{text[:6000]}"
+            )
+
         def request_comment_content(
+            prompt_text: str,
             *,
             base_url: str,
             model: str,
@@ -558,7 +661,7 @@ class OpenAIContentClient:
                     "input": [
                         {
                             "role": "user",
-                            "content": [{"type": "input_text", "text": prompt}],
+                            "content": [{"type": "input_text", "text": prompt_text}],
                         }
                     ],
                     "text": {"format": {"type": "json_object"}},
@@ -577,7 +680,7 @@ class OpenAIContentClient:
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": "你是社交媒体评论草稿助手。只能输出 JSON。"},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": prompt_text},
                 ],
             }
             print(f"Generating comment with {label}: model={model} wire=chat", flush=True)
@@ -589,45 +692,66 @@ class OpenAIContentClient:
             )
             return extract_chat_text(data)
 
-        content = request_comment_content(
-            base_url=self.base_url,
-            model=self.text_model,
-            wire_api=self.wire_api,
-            api_key=self.api_key,
-            use_image_session=False,
-            label="primary text key",
-        )
-        if not normalize_comment(parse_json_object(content).get("comment")) and not normalize_comment(content):
-            fallback_enabled = env_bool("OPENAI_TEXT_FALLBACK_TO_IMAGE_KEY", True)
-            if fallback_enabled and self.image_api_key:
-                fallback_base_url = (os.getenv("OPENAI_TEXT_FALLBACK_BASE_URL") or self.image_base_url).strip().rstrip("/")
-                fallback_model = (os.getenv("OPENAI_TEXT_FALLBACK_MODEL") or self.text_model).strip()
-                fallback_wire_api = (os.getenv("OPENAI_TEXT_FALLBACK_WIRE_API") or self.wire_api).strip().lower()
-                print("Primary comment generation failed; retrying with image OpenAI key.", flush=True)
-                content = request_comment_content(
-                    base_url=fallback_base_url,
-                    model=fallback_model,
-                    wire_api=fallback_wire_api,
-                    api_key=self.image_api_key,
-                    use_image_session=True,
-                    label="fallback image key",
+        def request_with_fallback(prompt_text: str) -> str:
+            content = request_comment_content(
+                prompt_text,
+                base_url=self.base_url,
+                model=self.text_model,
+                wire_api=self.wire_api,
+                api_key=self.api_key,
+                use_image_session=False,
+                label="primary text key",
+            )
+            if not normalize_comment(parse_json_object(content).get("comment")) and not normalize_comment(content):
+                fallback_enabled = env_bool("OPENAI_TEXT_FALLBACK_TO_IMAGE_KEY", True)
+                if fallback_enabled and self.image_api_key:
+                    fallback_base_url = (os.getenv("OPENAI_TEXT_FALLBACK_BASE_URL") or self.image_base_url).strip().rstrip("/")
+                    fallback_model = (os.getenv("OPENAI_TEXT_FALLBACK_MODEL") or self.text_model).strip()
+                    fallback_wire_api = (os.getenv("OPENAI_TEXT_FALLBACK_WIRE_API") or self.wire_api).strip().lower()
+                    print("Primary comment generation failed; retrying with image OpenAI key.", flush=True)
+                    content = request_comment_content(
+                        prompt_text,
+                        base_url=fallback_base_url,
+                        model=fallback_model,
+                        wire_api=fallback_wire_api,
+                        api_key=self.image_api_key,
+                        use_image_session=True,
+                        label="fallback image key",
+                    )
+            return content
+
+        retry_rule = ""
+        last_result: Optional[Dict[str, str]] = None
+        for attempt in range(1, 4):
+            content = request_with_fallback(build_prompt(retry_rule))
+            parsed = parse_json_object(content)
+            comment = normalize_comment(parsed.get("comment"))
+            if not comment:
+                comment = normalize_comment(content)
+            if comment:
+                comment = soften_comment_start(comment)
+                comment = clean_broken_emoji_text(comment)
+                comment = soften_mechanical_phrases(comment)
+                comment = soften_product_keywords(comment)
+                comment = append_safe_emoji(comment)
+            result = {"comment": comment or "", "rationale": str(parsed.get("rationale") or "").strip()}
+            if not result["comment"]:
+                last_result = result
+                continue
+            if recent_comments and self._comment_is_too_similar(result["comment"], recent_comments):
+                retry_rule = (
+                    f"- 上一版候选评论是：{result['comment']}。它和最近评论太像了，必须彻底换一种说法；"
+                    "下一版请换开头、换场景词、换形容词组合、换句子节奏，不能只做轻微改写。\n"
                 )
-        parsed = parse_json_object(content)
-        comment = normalize_comment(parsed.get("comment"))
-        if not comment:
-            comment = normalize_comment(content)
-        if comment:
-            comment = soften_comment_start(comment)
-            comment = clean_broken_emoji_text(comment)
-            comment = soften_mechanical_phrases(comment)
-            comment = soften_product_keywords(comment)
-            comment = append_safe_emoji(comment)
-        result = {"comment": comment or "", "rationale": str(parsed.get("rationale") or "").strip()}
-        if not result["comment"]:
-            self.comment_cache[cache_key] = None
-            return None
-        self.comment_cache[cache_key] = result
-        return result
+                last_result = result
+                if attempt < 3:
+                    continue
+            self._remember_comment(result["comment"])
+            self.comment_cache[cache_key] = result
+            return result
+
+        self.comment_cache[cache_key] = last_result if last_result and last_result.get("comment") else None
+        return self.comment_cache[cache_key]
 
     def generate_image(self, prompt: str, output_path: str, size: str = "1024x1024", quality: str = "auto") -> Optional[str]:
         image_prompt = (prompt or "").strip()
@@ -925,6 +1049,490 @@ def build_post_image_prompt(post_content: str, style: str) -> str:
     )
 
 
+SEED_PRODUCT_KEYWORDS = (
+    " seed ",
+    " seeds ",
+    "seed packet",
+    "seedling",
+    "germination",
+    "non-gmo",
+    "heirloom",
+    "vegetable seed",
+    "flower seed",
+    "herb seed",
+    "种子",
+    "播种",
+    "育苗",
+    "发芽",
+)
+
+ARTIFICIAL_FLOWER_KEYWORDS = (
+    "artificial flower",
+    "artificial flowers",
+    "fake flower",
+    "fake flowers",
+    "faux flower",
+    "faux flowers",
+    "silk flower",
+    "silk flowers",
+    "wreath",
+    "hanging basket",
+    "door hanger",
+    "door decor",
+    "front door decor",
+    "porch decor",
+    "仿真花",
+    "假花",
+    "花篮",
+)
+
+FLOWER_SEED_KEYWORDS = (
+    "sunflower",
+    "marigold",
+    "zinnia",
+    "cosmos",
+    "petunia",
+    "lavender",
+    "wildflower",
+    "rose",
+    "daisy",
+    "aster",
+    "bloom",
+    "flower seed",
+    "花种",
+    "花籽",
+)
+
+VEGETABLE_SEED_KEYWORDS = (
+    "tomato",
+    "pepper",
+    "cucumber",
+    "lettuce",
+    "bean",
+    "okra",
+    "radish",
+    "carrot",
+    "onion",
+    "pumpkin",
+    "squash",
+    "broccoli",
+    "cabbage",
+    "vegetable seed",
+    "蔬菜种子",
+    "菜籽",
+    "番茄",
+    "辣椒",
+    "黄瓜",
+    "生菜",
+)
+
+HERB_SEED_KEYWORDS = (
+    "basil",
+    "mint",
+    "parsley",
+    "cilantro",
+    "coriander",
+    "thyme",
+    "dill",
+    "oregano",
+    "rosemary",
+    "sage",
+    "herb seed",
+    "香草种子",
+    "罗勒",
+    "薄荷",
+    "香菜",
+)
+
+
+def _contains_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def _extract_context_label(product_context: str, label: str) -> str:
+    prefix = f"{label}:"
+    for line in (product_context or "").splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return ""
+
+
+def _compact_text(value: str, limit: int = 240) -> str:
+    compacted = " ".join((value or "").split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 3].rstrip() + "..."
+
+
+def _product_url_slug_text(product_url: str) -> str:
+    path = urlparse(product_url or "").path or ""
+    if not path:
+        return ""
+    return re.sub(r"[-_/]+", " ", path).strip().lower()
+
+
+def _keyword_hits(text: str, keywords: tuple[str, ...]) -> list[str]:
+    return [keyword for keyword in keywords if keyword in text]
+
+
+def _score_keyword_hits(sections: Dict[str, str], keywords: tuple[str, ...]) -> tuple[int, list[str]]:
+    weights = {
+        "title": 5,
+        "h1": 5,
+        "description": 4,
+        "body": 2,
+        "post": 2,
+        "slug": 3,
+    }
+    score = 0
+    evidence: list[str] = []
+    for section_name, text in sections.items():
+        hits = _keyword_hits(text, keywords)
+        if not hits:
+            continue
+        score += weights.get(section_name, 1) * len(hits)
+        evidence.extend(f"{section_name}:{hit}" for hit in hits[:4])
+    return score, evidence
+
+
+def _derive_scene_hint(category: str, subtype: str, combined_text: str) -> str:
+    text = f" {combined_text} "
+    if category == "artificial_flower":
+        if any(item in text for item in ("front door", "doorway", "entryway", "door decor", "front step")):
+            return "front door or entryway"
+        if any(item in text for item in ("porch", "patio", "deck", "outside")):
+            return "porch or patio corner"
+        if any(item in text for item in ("hanging basket", "railing", "hook")):
+            return "porch hook or railing side"
+        return "home entry, porch, or patio corner"
+
+    if category == "seed":
+        if any(item in text for item in ("raised bed", "garden bed", "veggie patch", "vegetable patch")):
+            return "backyard garden bed"
+        if any(item in text for item in ("windowsill", "window sill", "kitchen window")):
+            return "windowsill planter"
+        if any(item in text for item in ("balcony", "patio planter")):
+            return "balcony or patio planter"
+        if any(item in text for item in ("planter", "flowerpot", "pot", "container")):
+            return "home planter or flowerpot"
+        if subtype == "herb_seed":
+            return "windowsill or balcony herb pot"
+        if subtype == "vegetable_seed":
+            return "small backyard vegetable patch"
+        if subtype == "flower_seed":
+            return "flowerpot or backyard flower bed"
+        return "home garden soil or planter"
+
+    if any(item in text for item in ("garden", "yard", "outdoor")):
+        return "yard or garden edge"
+    if any(item in text for item in ("kitchen", "table", "shelf")):
+        return "ordinary home surface"
+    return "grounded everyday home setting"
+
+
+def _build_product_summary(title: str, h1: str, description: str, body: str, post_content: str) -> str:
+    parts = [title, h1, description]
+    body_excerpt = _compact_text(body, 220)
+    if body_excerpt:
+        parts.append(body_excerpt)
+    post_excerpt = _compact_text(post_content, 180)
+    if post_excerpt:
+        parts.append(post_excerpt)
+    summary = " | ".join(part for part in parts if part)
+    return summary[:800]
+
+
+def _choose_seed_growth_plan(subtype: str) -> Dict[str, str]:
+    growth_plans = {
+        "flower_seed": [
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "tiny new sprouts just breaking through damp soil",
+                "suggested_setting": "small flowerpot or seed tray on a backyard step",
+                "scene_detail": "dark moist soil, a few tiny green tips, ordinary patio or garden-edge surroundings",
+            },
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "fresh little shoots emerging in a nursery tray with visible damp soil",
+                "suggested_setting": "simple seed-starting tray near a yard wall or outdoor table",
+                "scene_detail": "seed tray cells, wet soil, messy but normal home gardening setup",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "small healthy flower seedlings with a couple of tender leaves",
+                "suggested_setting": "terracotta pot on a patio step",
+                "scene_detail": "young seedlings, pot rim, soil surface, casual home garden corner",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "several young flower seedlings grouped in a simple garden bed edge",
+                "suggested_setting": "backyard flower bed border",
+                "scene_detail": "fresh leaves, loose soil, grounded backyard flower bed details",
+            },
+            {
+                "stage_key": "early_growth",
+                "stage_label": "early growth stage",
+                "image_stage": "young flower plants in active early growth before any bloom appears",
+                "suggested_setting": "small backyard bed beside a garden path",
+                "scene_detail": "green leafy young plants, soil still visible, not mature and not blooming yet",
+            },
+        ],
+        "vegetable_seed": [
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "new vegetable sprouts poking through damp garden soil",
+                "suggested_setting": "small backyard vegetable patch",
+                "scene_detail": "moist soil, a few tiny sprouts, practical garden-bed texture",
+            },
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "freshly emerged sprouts in starter cups or a black seedling tray",
+                "suggested_setting": "starter tray on a plain outdoor table",
+                "scene_detail": "starter cups, soil crumbs, low-key home gardening mess",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "sturdy little vegetable seedlings with a few bright leaves",
+                "suggested_setting": "raised garden bed in a backyard vegetable corner",
+                "scene_detail": "raised bed wood edge, small seedlings, dark soil, practical home garden feel",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "young edible seedlings lined up in a simple home planter",
+                "suggested_setting": "rectangular planter near a yard wall or balcony edge",
+                "scene_detail": "young green starts, visible soil, grounded home-growing setup",
+            },
+            {
+                "stage_key": "early_growth",
+                "stage_label": "early growth stage",
+                "image_stage": "young vegetable plants in active growth with fresh leaves but not harvest-ready",
+                "suggested_setting": "kitchen-garden corner with real soil and simple tools nearby",
+                "scene_detail": "leafy young plants, soil rows, still far from mature produce",
+            },
+        ],
+        "herb_seed": [
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "tiny herb sprouts just showing above the soil line",
+                "suggested_setting": "small clay pot on a kitchen windowsill",
+                "scene_detail": "tiny green sprouts, damp potting mix, natural window light",
+            },
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "delicate new herb sprouts in a compact planter with visible soil",
+                "suggested_setting": "small balcony planter with everyday home clutter nearby",
+                "scene_detail": "small planter, dark soil, subtle home-use context",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "dense little herb seedlings with fresh bright leaves",
+                "suggested_setting": "countertop nursery pot near a bright window",
+                "scene_detail": "small herb seedlings, planter rim, window light, ordinary kitchen corner",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "young herb starts growing evenly in a compact home pot",
+                "suggested_setting": "balcony shelf planter or windowsill pot",
+                "scene_detail": "small leaves, soil visible, casual home-growing setup",
+            },
+            {
+                "stage_key": "early_growth",
+                "stage_label": "early growth stage",
+                "image_stage": "young herb plants in active early growth, still small and clearly not mature",
+                "suggested_setting": "patio or windowsill herb planter",
+                "scene_detail": "lively green growth, small planter, not a full mature herb bunch",
+            },
+        ],
+        "seed": [
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "fresh green sprouts emerging from loose dark soil",
+                "suggested_setting": "simple flowerpot with dark soil",
+                "scene_detail": "sprouts, damp soil, grounded home-garden look",
+            },
+            {
+                "stage_key": "germination",
+                "stage_label": "germination stage",
+                "image_stage": "small new shoots appearing in a plain seed tray",
+                "suggested_setting": "home nursery tray or planter",
+                "scene_detail": "nursery cells, visible soil, everyday gardening setup",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "healthy small seedlings in a simple home-growing setup",
+                "suggested_setting": "yard-side garden patch with grounded details",
+                "scene_detail": "small leaves, visible soil, casual backyard planting context",
+            },
+            {
+                "stage_key": "seedling",
+                "stage_label": "seedling stage",
+                "image_stage": "young seedlings in a modest planter with fresh soil",
+                "suggested_setting": "small patio planter or garden edge",
+                "scene_detail": "young green starts, planter rim, realistic home environment",
+            },
+            {
+                "stage_key": "early_growth",
+                "stage_label": "early growth stage",
+                "image_stage": "young plants in active early growth, still clearly not mature",
+                "suggested_setting": "simple garden plot or planter bed",
+                "scene_detail": "visible soil, early growth leaves, real-life planting progress",
+            },
+        ],
+    }
+    return random.choice(growth_plans.get(subtype, growth_plans["seed"]))
+
+
+def detect_product_profile(product_context: str, post_content: str = "", product_url: str = "") -> Dict[str, str]:
+    title = _extract_context_label(product_context, "Title")
+    h1 = _extract_context_label(product_context, "H1")
+    description = _extract_context_label(product_context, "Description")
+    body = ""
+    body_prefix = "Visible product page text:"
+    if body_prefix in (product_context or ""):
+        body = (product_context or "").split(body_prefix, 1)[1].strip()
+
+    slug_text = _product_url_slug_text(product_url)
+    sections = {
+        "title": f" {_compact_text(title, 240).lower()} ",
+        "h1": f" {_compact_text(h1, 240).lower()} ",
+        "description": f" {_compact_text(description, 360).lower()} ",
+        "body": f" {_compact_text(body, 1800).lower()} ",
+        "post": f" {_compact_text(post_content, 900).lower()} ",
+        "slug": f" {slug_text} ",
+    }
+
+    seed_score, seed_evidence = _score_keyword_hits(sections, SEED_PRODUCT_KEYWORDS)
+    flower_score, flower_evidence = _score_keyword_hits(sections, ARTIFICIAL_FLOWER_KEYWORDS)
+    flower_seed_score, _ = _score_keyword_hits(sections, FLOWER_SEED_KEYWORDS)
+    vegetable_seed_score, _ = _score_keyword_hits(sections, VEGETABLE_SEED_KEYWORDS)
+    herb_seed_score, _ = _score_keyword_hits(sections, HERB_SEED_KEYWORDS)
+
+    category = "general"
+    subtype = "general"
+
+    if flower_score >= max(4, seed_score + 2):
+        category = "artificial_flower"
+        subtype = "artificial_flower"
+    elif seed_score >= max(4, flower_score + 1):
+        category = "seed"
+        subtype_scores = {
+            "flower_seed": flower_seed_score,
+            "vegetable_seed": vegetable_seed_score,
+            "herb_seed": herb_seed_score,
+        }
+        subtype = max(subtype_scores, key=subtype_scores.get)
+        if subtype_scores[subtype] <= 0:
+            subtype = "seed"
+
+    product_name = title or h1 or "product from landing page"
+    product_summary = _build_product_summary(title, h1, description, body, post_content)
+    scene_hint = _derive_scene_hint(
+        category=category,
+        subtype=subtype,
+        combined_text="\n".join([title, h1, description, body, post_content, slug_text]).lower(),
+    )
+    detection_reason = ", ".join((flower_evidence if category == "artificial_flower" else seed_evidence)[:6]) or "context-derived"
+
+    if category == "seed":
+        growth_plan = _choose_seed_growth_plan(subtype)
+        comment_focus_options = {
+            "flower_seed": ["发芽期待感", "小花园生命力", "花园氛围", "刚种下就很有感觉"],
+            "vegetable_seed": ["菜园起步感", "长势期待", "种着挺值", "实用的小院种植感"],
+            "herb_seed": ["窗边小盆栽感", "清新长势", "小空间也能种", "刚种下就很有生活气"],
+            "seed": ["生命力", "发芽期待感", "刚种下的满足感", "小花园成就感"],
+        }
+        return {
+            "category": category,
+            "subtype": subtype,
+            "title_hint": product_name[:160],
+            "product_name": product_name[:160],
+            "product_summary": product_summary,
+            "scene_hint": scene_hint,
+            "detection_reason": detection_reason,
+            "display_name": {
+                "flower_seed": "flower seed",
+                "vegetable_seed": "vegetable seed",
+                "herb_seed": "herb seed",
+                "seed": "seed",
+            }.get(subtype, "seed"),
+            "image_stage": growth_plan["image_stage"],
+            "suggested_setting": growth_plan["suggested_setting"],
+            "growth_stage_key": growth_plan["stage_key"],
+            "growth_stage_label": growth_plan["stage_label"],
+            "scene_detail": growth_plan["scene_detail"],
+            "comment_focus": random.choice(comment_focus_options.get(subtype, comment_focus_options["seed"])),
+            "image_strategy": "seed_growth",
+        }
+
+    if category == "artificial_flower":
+        return {
+            "category": category,
+            "subtype": subtype,
+            "title_hint": product_name[:160],
+            "product_name": product_name[:160],
+            "product_summary": product_summary,
+            "scene_hint": scene_hint,
+            "detection_reason": detection_reason,
+            "display_name": "artificial flower",
+            "image_stage": "",
+            "suggested_setting": random.choice([scene_hint, "front door or porch corner", "patio step or entryway nook"]),
+            "comment_focus": random.choice(["low maintenance", "pretty little pop", "easy decor lift", "casual home charm"]),
+            "image_strategy": "reference_product_scene",
+        }
+
+    return {
+        "category": category,
+        "subtype": subtype,
+        "title_hint": product_name[:160],
+        "product_name": product_name[:160],
+        "product_summary": product_summary,
+        "scene_hint": scene_hint,
+        "detection_reason": detection_reason,
+        "display_name": "general product",
+        "image_stage": "",
+        "suggested_setting": "grounded everyday home setting",
+        "comment_focus": random.choice(["looks useful", "nice everyday feel", "good value", "simple charm"]),
+        "image_strategy": "reference_product_scene",
+    }
+
+
+def build_product_brief_text(product_profile: Dict[str, str]) -> str:
+    profile = product_profile or {}
+    parts = [
+        f"Category: {profile.get('category') or 'general'}",
+        f"Subtype: {profile.get('subtype') or 'general'}",
+        f"Product name hint: {profile.get('product_name') or profile.get('title_hint') or 'unknown'}",
+        f"Product summary: {profile.get('product_summary') or 'n/a'}",
+        f"Scene hint: {profile.get('scene_hint') or profile.get('suggested_setting') or 'n/a'}",
+        f"Comment focus: {profile.get('comment_focus') or 'n/a'}",
+        f"Image strategy: {profile.get('image_strategy') or 'n/a'}",
+        f"Detection reason: {profile.get('detection_reason') or 'n/a'}",
+    ]
+    if profile.get("category") == "seed":
+        parts.extend(
+            [
+                f"Growth stage: {profile.get('growth_stage_label') or 'n/a'}",
+                f"Image stage target: {profile.get('image_stage') or 'n/a'}",
+                f"Scene details: {profile.get('scene_detail') or 'n/a'}",
+            ]
+        )
+    return "\n".join(parts)
+
+
 PRODUCT_PHOTO_COMPOSITION_PRESETS = [
     (
         "diagonal walk-by phone shot",
@@ -1042,15 +1650,67 @@ def build_product_scene_image_prompt(
     use_cases: str,
     style: str,
     composition: str = "",
+    product_profile: Optional[Dict[str, str]] = None,
 ) -> str:
+    profile = product_profile or detect_product_profile(product_context=product_context, post_content=post_content)
     post = " ".join((post_content or "").split())
     product = " ".join((product_context or "").split())
     scenarios = " ".join((use_cases or "").split())
     composition_text = " ".join((composition or "").split())
+    if profile.get("category") == "seed":
+        growth_stage = profile.get("image_stage") or "healthy seedlings in early growth"
+        suggested_setting = profile.get("suggested_setting") or "simple flowerpot or garden soil"
+        seed_kind = profile.get("display_name") or "seed"
+        focus = profile.get("comment_focus") or "fresh growth energy"
+        title_hint = profile.get("title_hint") or "seed variety from the landing page"
+        growth_stage_label = profile.get("growth_stage_label") or "germination or seedling stage"
+        scene_detail = profile.get("scene_detail") or "visible soil and a grounded home-growing scene"
+        product_summary = profile.get("product_summary") or product[:1200]
+        scene_hint = profile.get("scene_hint") or suggested_setting
+        return (
+            "This is a seed product, so do not generate the finished commercial product photo style. "
+            "Create a realistic customer progress photo taken after planting the seeds at home, during germination or early growth, not a catalog shot and not a mature showcase image. "
+            "Treat the landing-page information only as plant identity guidance: infer the likely seed variety, leaf character, plant family, and expected growth look from the title and description. "
+            f"Seed variety hint from the landing page: {title_hint}. "
+            f"Ground truth product summary from the landing page and post: {product_summary[:900]}. "
+            "Do not make the seed packet, product bag, label card, studio backdrop, mature bouquet, harvested final produce, or packaging the main subject. "
+            f"Chosen growth window for this image: {growth_stage_label}. "
+            "Main subject should be the living plant growth that would come from this seed: "
+            f"{growth_stage}. "
+            f"The seed type is best interpreted as: {seed_kind}. "
+            "Show visible soil, planters, nursery cells, pots, garden beds, or a grounded home-growing environment. "
+            "The plant must look young, alive, and still in progress, with clear sprouting or seedling-stage energy. "
+            "Do not skip ahead to a polished mature end-state; keep it in germination, seedling, or early growth stage only. "
+            "Absolutely do not show full flowers, finished bouquets, mature vegetables, harvest-ready produce, or a final landscaping result. "
+            "The background must feel earthy and believable: potting soil, terracotta or plastic pots, vegetable patch, yard border, balcony planter, or home garden corner. "
+            f"Concrete scene details to include when natural: {scene_detail}. "
+            "Keep it very down-to-earth, like a casual customer progress photo taken right after planting or while checking on the first growth. "
+            "No people, no hands, no studio setup, no showroom surface, no glossy packaging display, no fake luxury styling. "
+            "If the landing page shows mature flowers or produce, use that only to understand the plant identity; the generated image must still stay in sprout, seedling, or active growing stage. "
+            "The image should communicate vigor, healthy growth, and real-life planting progress. "
+            "Add small ordinary details when helpful: damp soil, planter rim, seed tray, garden edge, watering can in the background, simple gardening clutter, backyard dirt texture. "
+            "Do not add readable text, labels, price tags, QR codes, platform UI, or watermarks. "
+            "Keep the shot naturally in focus with normal phone-camera depth of field, not dramatic blur. "
+            "Camera and composition should still vary like a real user photo. "
+            f"Selected viewpoint: {composition_text or 'natural varied phone-camera gardening angle'}. "
+            "Avoid centered catalog composition; make it feel like a real quick photo from a pot side, garden edge, windowsill, or raised bed. "
+            f"Scene target inferred from the product info: {scene_hint}. "
+            f"Grounded growing setting: {suggested_setting}. "
+            f"Visual mood emphasis: {focus}. "
+            f"Visual style: {style}. "
+            f"Suggested customer-use setting: {scenarios or suggested_setting}. "
+            f"Post context: {post[:1800]}. "
+            f"Product context: {product[:3200]}."
+        )
+    product_name = profile.get("product_name") or profile.get("title_hint") or "landing-page product"
+    product_summary = profile.get("product_summary") or product[:1200]
+    scene_hint = profile.get("scene_hint") or profile.get("suggested_setting") or "realistic home setting"
     return (
         "Use the provided product reference image(s) as the source of truth. "
         "Create a realistic user-taken product photo by keeping the exact referenced product and placing it in a completely new everyday surrounding scene. "
         "Highest priority: the product must match the landing-page product as closely as possible. "
+        f"Product identity hint: {product_name}. "
+        f"Product summary from the landing page and post: {product_summary[:900]}. "
         "Do not redesign, beautify, simplify, recolor, resize, or reinterpret the product. "
         "Keep the same product type, shape, structure, color pattern, material feel, density/fullness, proportions, visible parts, and overall look shown in the landing-page context and image references. "
         "Use the reference image only for the product appearance, not for the background. "
@@ -1080,7 +1740,8 @@ def build_product_scene_image_prompt(
         "Avoid repeating a straight-on centered catalog angle unless the selected viewpoint explicitly requires it. "
         "Do not include Facebook UI, platform logos, watermarks, price tags, QR codes, readable text, or captions. "
         f"Visual style: {style}. "
-        f"Suggested customer-use setting: {scenarios or 'derive a realistic everyday setting from the product details'}. "
+        f"Scene target inferred from the product info: {scene_hint}. "
+        f"Suggested customer-use setting: {scenarios or scene_hint or 'derive a realistic everyday setting from the product details'}. "
         f"Post context: {post[:1800]}. "
         f"Product context: {product[:3200]}."
     )

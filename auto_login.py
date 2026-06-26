@@ -24,9 +24,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from openai_content_client import (
     OpenAIContentClient,
+    build_product_brief_text,
     build_post_image_prompt,
     build_product_scene_image_prompt,
     choose_product_photo_composition,
+    detect_product_profile,
     extract_image_urls_from_context,
 )
 
@@ -127,6 +129,44 @@ EXPERIENCE_COMMENT_ANGLES = (
     "基于真实体验素材，写朋友或家人真实反馈不错，但保持一句话、像随口说。",
     "基于真实体验素材，写实物的一个基础特点和使用场景，比想象中顺眼。",
     "基于真实体验素材，写我喜欢把它放在哪里，或者家人也喜欢这个小布置。",
+)
+
+SEED_COMMENT_ANGLES = (
+    "主打刚把种子种进花园、土地或花盆后的即时感觉，像看着它慢慢要发芽那种自然期待。",
+    "强调这是刚买回来开始种的种子，不是装饰品；语气像随手拍了张自家种植进度图后顺口说一句。",
+    "夸它种下去之后很有生命力、很有盼头，也可以自然带一点挺值的感觉。",
+    "可以写刚撒进土里、刚种进小花园、刚放进花盆这类场景，但不要写成熟成品效果。",
+    "花种更偏刚种下后的开花期待，菜种更偏小菜园起步感，香草种更偏窗边小盆和生活感。",
+    "可以写 just planted / just started these / waiting for the first sprouts 这类感觉，但每次别重复。",
+)
+
+SEED_COMMENT_OPENING_STYLES = (
+    "开头从刚种下、刚埋进土里、等它发芽的心情切入，但不要每次都一样。",
+    "可以用 honestly / lowkey / ngl / okay / this kind of thing 开头，也可以直接上感受句。",
+    "不要用假花/门口装饰那套开头，改成花盆、土、菜园、阳台种植的语境。",
+    "允许短碎句，像刷到一个园艺帖子顺手回一句。",
+)
+
+SEED_COMMENT_DETAIL_FOCUS = (
+    "本次只提一个重点：刚种下的感觉、等发芽的期待、小盆起步、菜园角落、土壤生命力、划算，随机取其一。",
+    "场景优先用 pot / soil / garden bed / backyard dirt / little planter / veggie patch / windowsill 这些接地气词。",
+    "避免重复 cute colors / by the door / porch decor 这些装饰品表达。",
+    "多用 this / it / these seeds / this little garden start，少直接复述产品名。",
+)
+
+SEED_COMMENT_LENGTH_STYLES = (
+    "长度控制在 8-14 个英文词，或 18-32 个中文字符。",
+    "写成一个短句，像刚种下后看着土和花盆时的即时感受。",
+    "可以写成两个很短的片段，用 & 连接，但不要像广告标语。",
+    "句子节奏和常见 decor 评论明显区分，尽量更朴实一点。",
+)
+
+COMMENT_DISTINCTIVE_PATTERNS = (
+    "这次用偏判断句，像“it looks...”/“this feels...”/“这看着...”这种。",
+    "这次用偏打算句，像“I'd start it...”/“我会先种在...”这种。",
+    "这次用偏轻微惊喜句，像“didn't expect...”/“还挺...”这种。",
+    "这次用偏价值感句，像“worth it”/“挺值的”这种，但不要像促销。",
+    "这次用偏场景句，先点出花盆、菜园、窗边或角落，再给感受。",
 )
 
 
@@ -269,21 +309,33 @@ def parse_comment_items(value: str) -> list[str]:
     return [item.strip() for item in items if item.strip()]
 
 
-def build_comment_style(base_style: str) -> str:
+def build_comment_style(base_style: str, product_profile: dict[str, str] | None = None) -> str:
+    profile = product_profile or {}
+    is_seed = profile.get("category") == "seed"
+    product_name = profile.get("product_name") or profile.get("title_hint") or "this product"
+    scene_hint = profile.get("scene_hint") or profile.get("suggested_setting") or "a realistic home setting"
+    product_summary = profile.get("product_summary") or ""
     experience_notes = (os.getenv("AI_COMMENT_EXPERIENCE_NOTES") or "").strip()
     custom_angles = parse_comment_items(os.getenv("AI_COMMENT_ANGLES") or "")
-    angles = custom_angles or list(DEFAULT_COMMENT_ANGLES)
+    angles = custom_angles or list(SEED_COMMENT_ANGLES if is_seed else DEFAULT_COMMENT_ANGLES)
     if experience_notes:
         angles = angles + list(EXPERIENCE_COMMENT_ANGLES)
     angle = random.choice(angles)
-    opening_style = random.choice(COMMENT_OPENING_STYLES)
-    detail_focus = random.choice(COMMENT_DETAIL_FOCUS)
-    length_style = random.choice(COMMENT_LENGTH_STYLES)
+    opening_style = random.choice(SEED_COMMENT_OPENING_STYLES if is_seed else COMMENT_OPENING_STYLES)
+    detail_focus = random.choice(SEED_COMMENT_DETAIL_FOCUS if is_seed else COMMENT_DETAIL_FOCUS)
+    length_style = random.choice(SEED_COMMENT_LENGTH_STYLES if is_seed else COMMENT_LENGTH_STYLES)
+    distinctive_pattern = random.choice(COMMENT_DISTINCTIVE_PATTERNS)
 
     if experience_notes:
         experience_rule = (
             "真实体验素材："
             f"{experience_notes[:600]}。可以基于这些素材写收到实物、使用便捷、朋友/家人反馈等亲历内容。"
+        )
+    elif is_seed:
+        experience_rule = (
+            "真实体验素材：未提供，但种子类这次允许使用“刚买回来就种下/刚撒进土里/刚放进花盆里”的轻度第一人称场景，"
+            "因为目标就是模拟自家花园或土地里的即时种植感；"
+            "只写刚开始种和等发芽的感觉，不要写已经长成、已经收获、已经开花。"
         )
     else:
         experience_rule = (
@@ -292,16 +344,41 @@ def build_comment_style(base_style: str) -> str:
             "looks / would / should / 看起来 / 我会放在... / 家里人应该会喜欢 这类偏好或推测。"
         )
 
+    if is_seed:
+        product_rule = (
+            "产品识别结果：种子类。"
+            f"当前细分更像 {profile.get('display_name') or 'seed'}，产品名线索是 {product_name}；"
+            f"评论重点优先从 {profile.get('comment_focus') or '生命力'} 切入；"
+            f"场景更贴近 {scene_hint}。"
+            "不要写成假花、门口挂饰、porch decor 那类装饰品评论；"
+            "这次更像刚把种子种进自家花园、土地、菜园角落或花盆里后拍照配一句话；"
+            "可以自然提到 just planted / soil / garden / dirt / pot / planter / backyard / waiting for sprouts 这一类词，但不要堆满；"
+            "不要把评论写成成熟成品效果，也不要只夸 useful and low effort 这种泛词。"
+        )
+    elif profile.get("category") == "artificial_flower":
+        product_rule = (
+            "产品识别结果：假花/仿真花类。"
+            f"产品名线索是 {product_name}，场景更贴近 {scene_hint}。"
+            "保持现在这种生活化轻夸就行，可以围绕低维护、顺眼、门口/阳台/角落摆放效果，但不要重复固定句式；"
+            "绝对不要出现种子、发芽、土里、小苗、生长期这类词。"
+        )
+    else:
+        product_rule = f"产品识别结果：通用商品。产品名线索是 {product_name}，场景更贴近 {scene_hint}。根据落地页内容自然判断最贴切的生活场景和优点。"
+
     return (
         f"{base_style}\n"
+        f"{product_rule}\n"
+        f"产品摘要线索：{product_summary[:500] or '无'}\n"
         f"本次随机评论角度：{angle}\n"
         f"本次随机开头/语气：{opening_style}\n"
         f"本次随机细节焦点：{detail_focus}\n"
         f"本次随机长度/节奏：{length_style}\n"
+        f"本次随机句式识别要求：{distinctive_pattern}\n"
         f"{experience_rule}\n"
         "强随机要求：每次都换句式、换开头、换场景词、换形容词组合；"
-        "不要连续使用 by the door / cute colors / no fuss 这类固定组合；"
-        "如果上一条可能像 I'd put this by the door，就换成 porch、front step、entryway、patio、little corner 等不同说法。"
+        "不要连续使用 by the door / cute colors / no fuss / worth planting / looks lively 这类固定组合；"
+        "如果上一条可能像 I'd put this by the door，就换成 porch、front step、entryway、patio、little corner、pot side、garden bed、windowsill 等不同说法；"
+        "这次生成的评论要有识别度，不能只是把上一类评论换 1-2 个词。"
     )
 
 
@@ -3123,10 +3200,28 @@ def main() -> None:
 
         if post_url and ai_product_promo:
             try:
+                product_profile = detect_product_profile(
+                    product_context=product_context,
+                    post_content=post_content,
+                    product_url=selected_product_url or product_url or "",
+                )
+                print(
+                    "Detected product profile: "
+                    f"category={product_profile.get('category')} "
+                    f"subtype={product_profile.get('subtype')} "
+                    f"name={product_profile.get('product_name')} "
+                    f"focus={product_profile.get('comment_focus')} "
+                    f"setting={product_profile.get('suggested_setting')} "
+                    f"reason={product_profile.get('detection_reason')}",
+                    flush=True,
+                )
+                product_brief_text = build_product_brief_text(product_profile)
+                print("Product brief:\n" + product_brief_text, flush=True)
                 combined_context = (
                     f"Facebook post:\n{post_content}\n\n"
                     f"Product link:\n{selected_product_url or product_url or 'not found'}\n\n"
                     f"Product page:\n{product_context}\n\n"
+                    f"Inferred product brief:\n{product_brief_text}\n\n"
                     f"Use cases to consider:\n{product_use_cases or 'derive from product details'}"
                 )
                 result = ai_client.generate_comment(
@@ -3134,7 +3229,11 @@ def main() -> None:
                     language=ai_language,
                     style=build_comment_style(
                         "随意一点，像真人刷到后随手写；不要用 The/the 开头；"
-                        "可以自然用 it / this / that，不用刻意说产品名；不要直接使用链接或标题里的关键词；偏好“好看 & 实用 / pretty & useful / cute & practical”这种短而有力的评价；表情由程序本地追加；别写成 slogan"
+                        "可以自然用 it / this / that，不用刻意说产品名；不要直接使用链接或标题里的关键词；"
+                        "要根据帖子和落地页里的具体产品信息来决定评论内容，而不是套模板；"
+                        "先看清楚产品到底是什么、应该出现在哪种生活场景、此时更像成品摆放还是刚种下后的生长进度，再写评论；"
+                        "表情由程序本地追加；别写成 slogan。",
+                        product_profile=product_profile,
                     ),
                 )
                 if not result or not result.get("comment"):
@@ -3152,35 +3251,58 @@ def main() -> None:
                     use_cases=product_use_cases,
                     style=image_style,
                     composition=f"{composition_name}: {composition_instruction}",
+                    product_profile=product_profile,
                 )
-                reference_urls = extract_image_urls_from_context(product_context)
-                if not reference_urls:
-                    prompt_path = Path(image_output).with_suffix(".prompt.txt")
-                    prompt_path.parent.mkdir(parents=True, exist_ok=True)
-                    prompt_path.write_text(product_prompt, encoding="utf-8")
-                    raise RuntimeError(
-                        "Could not find product image references on the landing page, so I will not generate a fake product image. "
-                        f"Saved the image prompt for inspection: {prompt_path}"
+                if product_profile.get("image_strategy") == "seed_growth":
+                    print(
+                        "Seed product detected; generating a planting-stage scene without reusing landing-page product photos.",
+                        flush=True,
                     )
-                print(f"Using product reference images: {', '.join(reference_urls[:2])}", flush=True)
-                output_path = ai_client.generate_image_with_references(
-                    prompt=product_prompt,
-                    output_path=image_output,
-                    reference_urls=reference_urls,
-                    size=image_size,
-                    quality=image_quality,
-                )
-                if not output_path:
-                    prompt_path = Path(image_output).with_suffix(".prompt.txt")
-                    prompt_path.parent.mkdir(parents=True, exist_ok=True)
-                    prompt_path.write_text(product_prompt, encoding="utf-8")
-                    if getattr(ai_client, "last_error", ""):
-                        print(f"Image generation error: {ai_client.last_error}", flush=True)
-                    raise RuntimeError(
-                        "Reference-based image generation failed. I will not fall back to text-only generation because that can create a different product. "
-                        f"Saved the image prompt for manual retry: {prompt_path}"
+                    output_path = ai_client.generate_image(
+                        prompt=product_prompt,
+                        output_path=image_output,
+                        size=image_size,
+                        quality=image_quality,
                     )
+                    if not output_path:
+                        prompt_path = Path(image_output).with_suffix(".prompt.txt")
+                        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                        prompt_path.write_text(product_prompt, encoding="utf-8")
+                        if getattr(ai_client, "last_error", ""):
+                            print(f"Image generation error: {ai_client.last_error}", flush=True)
+                        raise RuntimeError(
+                            "Seed growth image generation failed. Saved the seed-stage prompt for manual retry: "
+                            f"{prompt_path}"
+                        )
+                    print(f"Generated seed growth image saved: {output_path}", flush=True)
                 else:
+                    reference_urls = extract_image_urls_from_context(product_context)
+                    if not reference_urls:
+                        prompt_path = Path(image_output).with_suffix(".prompt.txt")
+                        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                        prompt_path.write_text(product_prompt, encoding="utf-8")
+                        raise RuntimeError(
+                            "Could not find product image references on the landing page, so I will not generate a fake product image. "
+                            f"Saved the image prompt for inspection: {prompt_path}"
+                        )
+                    print(f"Using product reference images: {', '.join(reference_urls[:2])}", flush=True)
+                    output_path = ai_client.generate_image_with_references(
+                        prompt=product_prompt,
+                        output_path=image_output,
+                        reference_urls=reference_urls,
+                        size=image_size,
+                        quality=image_quality,
+                    )
+                    if not output_path:
+                        prompt_path = Path(image_output).with_suffix(".prompt.txt")
+                        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                        prompt_path.write_text(product_prompt, encoding="utf-8")
+                        if getattr(ai_client, "last_error", ""):
+                            print(f"Image generation error: {ai_client.last_error}", flush=True)
+                        raise RuntimeError(
+                            "Reference-based image generation failed. I will not fall back to text-only generation because that can create a different product. "
+                            f"Saved the image prompt for manual retry: {prompt_path}"
+                        )
                     print(f"Generated product scenario image saved: {output_path}", flush=True)
 
                 comment_on_post(

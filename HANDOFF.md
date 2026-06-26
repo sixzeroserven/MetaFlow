@@ -83,15 +83,6 @@ MetaFlow 用于批量执行 Facebook 帖子评论任务，支持两种模式：
 - `account2`
 - `account3`
 
-已完成：
-
-- 本地移除 `account1`
-- 远端移除 `account1`
-- 远端旧 Chrome profile `chrome-profiles/account3` 已删除
-
-注意：不要把账号密码写进新的交接文档或对外文档。
-
-
 ## 6. 当前部署方式
 
 主服务跑在 Azure 服务器：
@@ -150,12 +141,3 @@ docker compose up -d --build
   - 把 `Product brief` 存档到 `generated/` 里，方便复盘
   - 做一组真实假花 / 种子样例回归测试
 
-
-## 10. 本次交接时工作区状态
-
-当前本地有未提交修改：
-
-- `auto_login.py`
-- `openai_content_client.py`
-
-这两处就是最近产品画像与评论/图片生成逻辑的主要变更点。
